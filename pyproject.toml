@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "embedopt"
+version = "0.1.0"
+description = "EmbedOpt: Robust Inference-Time Steering of Protein Diffusion Models via Embedding Optimization"
+readme = "README.md"
+authors = []
+requires-python = ">=3.11"
+dependencies = ["protenix==2.0.0", "scikit-bio==0.6.3", "pdbfixer==1.12.0", "mrcfile==1.5.4"]
+
+[project.optional-dependencies]
+tests = ["pytest>=7.0"]
+dev = ["pre-commit>=3.7", "ruff>=0.6.8"]
+
+[project.scripts]
+embedopt-crop-map = "embedopt.crop_map:main"
+
+[project.urls]
+Homepage = "https://github.com/minhuanli/embedoptv1"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 140
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = []
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.dependencies]
+python = "3.11.*"
+openmm = "==8.4.0"
+numpy = "==2.4.1"
+
+[tool.pixi.pypi-dependencies]
+embedopt = { path = ".", editable = true }
+sfcalculator-torch = "==0.3.2"
+
+[tool.pixi.pypi-options]
+dependency-overrides = { pandas = "==2.3.1" }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+tests = { features = ["tests"], solve-group = "default" }
+
+[tool.pixi.tasks]
