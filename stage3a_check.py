@@ -41,6 +41,20 @@ def ca_rmsd(ref, pred):
     return bs.rmsd(ca_r, bs.superimpose(ca_r, ca_p)[0]), bs.rmsd(ca_r, bs.superimpose(ca_r, mir)[0])
 
 
+def radius(a):  # radius of gyration and max atom radius about the centroid (heavy atoms)
+    x = a.coord[a.element != "H"]
+    r = np.linalg.norm(x - x.mean(0), axis=1)
+    return np.sqrt((r**2).mean()), r.max()
+
+
+def worst_residues(ref, pred, k=5):
+    ca_r, ca_p = ref[ref.atom_name == "CA"], pred[pred.atom_name == "CA"]
+    if len(ca_r) != len(ca_p):
+        return "n/a"
+    d = np.linalg.norm(bs.superimpose(ca_r, ca_p)[0].coord - ca_r.coord, axis=1)
+    return ", ".join(f"{ca_r.res_id[i]}: {d[i]:.1f}" for i in np.argsort(d)[::-1][:k])
+
+
 @torch.no_grad()
 def scores(rew, x):
     """x: (N_atom, 3) in rew's model-atom order. Returns global score, whitened score, per-l whitened errors."""
@@ -99,6 +113,8 @@ def main():
         g, w, per_l = scores(Stage3aOracleReward(a.ref, pred, resolution=a.resolution), pred.coord)
         lab = os.path.basename(f).replace(".cif", "")
         print(f"  {lab}\n    CA RMSD {rp:.2f} A (mirror {rm:.2f} A)   global {-g:.3e}   whitened {-w:.3e}")
+        print(f"    radius: Rg {radius(pred)[0]:.2f} A, max {radius(pred)[1]:.2f} A   (x*: Rg {radius(ref)[0]:.2f}, max {radius(ref)[1]:.2f})")
+        print(f"    largest CA deviations (res_id: A): {worst_residues(ref, pred)}")
         for j, (val, mk) in enumerate([(-g, "-"), (-w, ":")]):
             ax[1, 0].axhline(val, color=f"C{k + 2}", ls=mk, lw=1, label=f"{lab[:25]} {'global' if j == 0 else 'whitened'}")
         ax[1, 1].semilogy(per_l, label=f"{lab[:25]} ({rp:.1f} A)")

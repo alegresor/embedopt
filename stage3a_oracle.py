@@ -14,6 +14,7 @@ Usage: same CLI as embedopt.inference.inference, with a config whose reward is
 {"type": "map", "params": {"ref_pdb_path": <x* pdb>, "resolution": 5.0}} (ref_map_path ignored).
 """
 
+import biotite.structure as bs
 import gemmi
 import numpy as np
 import torch
@@ -38,6 +39,12 @@ def sph_harm(l, m, theta, phi):  # theta polar, phi azimuth; handles old/new sci
     return sp.sph_harm_y(l, m, theta, phi) if hasattr(sp, "sph_harm_y") else sp.sph_harm(m, l, phi, theta)
 
 
+def atom_keys(a):  # "residue ordinal:atom name"; residue ordinal counts residues in chain order
+    starts = bs.get_residue_starts(a)
+    res = np.searchsorted(starts, np.arange(len(a)), side="right") - 1
+    return [f"{r}:{n}" for r, n in zip(res, a.atom_name)]
+
+
 def kabsch_rmsd(P, Q):  # min RMSD of Q onto P over O(3); returns (rmsd_proper, rmsd_mirror)
     P, Q = P - P.mean(0), Q - Q.mean(0)
     U, S, Vt = np.linalg.svd(Q.T @ P)
@@ -55,14 +62,22 @@ class Stage3aOracleReward(Reward):
         self.dev = dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ref = PDBFile.read(ref_pdb_path).get_structure(model=1)
         ref = ref[ref.element != "H"]
-        self.keep = torch.as_tensor(pred_atom_array.element != "H", device=dev)
-        pred_el = pred_atom_array.element[pred_atom_array.element != "H"]
-        x_ref = torch.as_tensor(ref.coord, dtype=torch.float32, device=dev)
-        x_ref = x_ref - x_ref.mean(0)
 
-        # CA atoms for logging only (sequences match the FASTA, so CA lists align 1:1)
-        self.ca_pred = (pred_atom_array.atom_name == "CA")[pred_atom_array.element != "H"]
-        self.ca_ref = ref.coord[ref.atom_name == "CA"]
+        # Match model and reference atoms by (residue ordinal, atom name) so both sides have the SAME atom set
+        # (otherwise extra/missing atoms, e.g. OXT or truncated side chains, bias the moments and R(x*) != 0)
+        ref_idx = {k: i for i, k in enumerate(atom_keys(ref))}
+        model_keys = atom_keys(pred_atom_array)
+        keep = np.array([k in ref_idx and e != "H" for k, e in zip(model_keys, pred_atom_array.element)])
+        order = np.array([ref_idx[k] for k, m in zip(model_keys, keep) if m])
+        self.keep = torch.as_tensor(keep, device=dev)
+        pred_el = pred_atom_array.element[keep]
+        x_ref = torch.as_tensor(ref.coord[order], dtype=torch.float32, device=dev)  # model atom order
+        x_ref = x_ref - x_ref.mean(0)
+        n_drop_model, n_drop_ref = len(pred_atom_array) - keep.sum(), len(ref) - len(order)
+
+        # CA atoms for logging only
+        self.ca_pred = pred_atom_array.atom_name[keep] == "CA"
+        self.ca_ref = ref.coord[order][self.ca_pred]
 
         # Radial grid and SH bandlimit
         kmax = 1.0 / resolution
@@ -87,7 +102,7 @@ class Stage3aOracleReward(Reward):
         k2 = (self.kappa**2).cpu().numpy()
         table = {e: np.array([gemmi.Element(e).c4322.calculate_sf(s / 4) for s in k2]) for e in set(pred_el) | set(ref.element)}
         rho = lambda els: torch.as_tensor(np.stack([table[e] for e in els]) * np.exp(-B_FACTOR * k2 / 4), dtype=torch.float32, device=dev)
-        self.rho_pred, rho_ref = rho(pred_el), rho(ref.element)
+        self.rho_pred = rho_ref = rho(pred_el)  # matched atoms: same elements on both sides
 
         # Oracle invariants and invariance checks (should be ~0)
         with torch.no_grad():
@@ -96,7 +111,7 @@ class Stage3aOracleReward(Reward):
             err_rot = -self.loss_to_ref(x_ref @ Q.T, rho_ref)
             err_mir = -self.loss_to_ref(-x_ref, rho_ref)
         logger.info(
-            f"[Stage3a] {len(x_ref)} ref atoms, {len(pred_el)} model atoms, L={L}, {len(w)} S^2 nodes, "
+            f"[Stage3a] {len(order)} matched atoms (dropped {n_drop_model} model, {n_drop_ref} ref), L={L}, {len(w)} S^2 nodes, "
             f"{N_KAPPA} shells; invariance check: R(Q x*)={err_rot:.2e}, R(-x*)={err_mir:.2e}"
         )
 
