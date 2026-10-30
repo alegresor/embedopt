@@ -14,6 +14,8 @@ Usage: same CLI as embedopt.inference.inference, with a config whose reward is
 {"type": "map", "params": {"ref_pdb_path": <x* pdb>, "resolution": 5.0}} (ref_map_path ignored).
 """
 
+import functools
+
 import biotite.structure as bs
 import gemmi
 import numpy as np
@@ -37,6 +39,22 @@ def sph_harm(l, m, theta, phi):  # theta polar, phi azimuth; handles old/new sci
     import scipy.special as sp
 
     return sp.sph_harm_y(l, m, theta, phi) if hasattr(sp, "sph_harm_y") else sp.sph_harm(m, l, phi, theta)
+
+
+@functools.lru_cache(maxsize=2)
+def s2_quadrature(L, dev):
+    """Exact quadrature on S^2 for degree <= 2L+1: Gauss-Legendre in cos(theta) x trapezoid in phi.
+    Returns nodes omega (Nq, 3) and weighted conj(Y_lm) (Nq, (L+1)^2)."""
+    ct, wt = leggauss(L + 1)
+    ph = 2 * np.pi * np.arange(2 * L + 2) / (2 * L + 2)
+    TH, PH = np.meshgrid(np.arccos(ct), ph, indexing="ij")
+    TH, PH = TH.ravel(), PH.ravel()
+    w = (wt[:, None] * np.full(len(ph), 2 * np.pi / len(ph))[None]).ravel()
+    omega = np.stack([np.sin(TH) * np.cos(PH), np.sin(TH) * np.sin(PH), np.cos(TH)], 1)
+    ls = np.concatenate([np.full(2 * l + 1, l) for l in range(L + 1)])
+    ms = np.concatenate([np.arange(-l, l + 1) for l in range(L + 1)])
+    WYc = (w[:, None] * sph_harm(ls[None], ms[None], TH[:, None], PH[:, None]).conj()).astype(np.complex64)
+    return torch.as_tensor(omega, dtype=torch.float32, device=dev), torch.as_tensor(WYc, device=dev)
 
 
 def atom_keys(a):  # "residue ordinal:atom name"; residue ordinal counts residues in chain order
@@ -85,18 +103,7 @@ class Stage3aOracleReward(Reward):
         r_max = R_SAFETY * x_ref.norm(dim=1).max().item()
         self.L = L = int(np.ceil(2 * np.pi * kmax * r_max)) + L_PAD
 
-        # Exact quadrature on S^2 for degree <= 2L+1: Gauss-Legendre in cos(theta) x trapezoid in phi
-        ct, wt = leggauss(L + 1)
-        ph = 2 * np.pi * np.arange(2 * L + 2) / (2 * L + 2)
-        TH, PH = np.meshgrid(np.arccos(ct), ph, indexing="ij")
-        TH, PH = TH.ravel(), PH.ravel()
-        w = (wt[:, None] * np.full(len(ph), 2 * np.pi / len(ph))[None]).ravel()
-        omega = np.stack([np.sin(TH) * np.cos(PH), np.sin(TH) * np.sin(PH), np.cos(TH)], 1)
-        ls = np.concatenate([np.full(2 * l + 1, l) for l in range(L + 1)])
-        ms = np.concatenate([np.arange(-l, l + 1) for l in range(L + 1)])
-        Y = sph_harm(ls[None], ms[None], TH[:, None], PH[:, None])  # (Nq, (L+1)^2)
-        self.omega = torch.as_tensor(omega, dtype=torch.float32, device=dev)
-        self.WYc = torch.as_tensor(w[:, None] * Y.conj(), dtype=torch.complex64, device=dev)
+        self.omega, self.WYc = s2_quadrature(L, str(dev))  # cached: depends only on L (saves ~45 s per seed)
 
         # Atomic transforms rho_n(kappa) = f_e(kappa) exp(-B kappa^2 / 4), f_e from gemmi (as in SFC_Torch cryoem)
         k2 = (self.kappa**2).cpu().numpy()
@@ -111,7 +118,7 @@ class Stage3aOracleReward(Reward):
             err_rot = -self.loss_to_ref(x_ref @ Q.T, rho_ref)
             err_mir = -self.loss_to_ref(-x_ref, rho_ref)
         logger.info(
-            f"[Stage3a] {len(order)} matched atoms (dropped {n_drop_model} model, {n_drop_ref} ref), L={L}, {len(w)} S^2 nodes, "
+            f"[Stage3a] {len(order)} matched atoms (dropped {n_drop_model} model, {n_drop_ref} ref), L={L}, {len(self.omega)} S^2 nodes, "
             f"{N_KAPPA} shells; invariance check: R(Q x*)={err_rot:.2e}, R(-x*)={err_mir:.2e}"
         )
 

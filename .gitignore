@@ -1,4 +1,6 @@
-out/ 
+*.zip 
+out/
+out.old/ 
 cif_raw/
 fasta/ 
 json_minimal/
