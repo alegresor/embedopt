@@ -47,6 +47,21 @@ def radius(a):  # radius of gyration and max atom radius about the centroid (hea
     return np.sqrt((r**2).mean()), r.max()
 
 
+def core_fit(ref, pred, frac=0.8, iters=20):
+    """Iteratively superimpose on the best-fitting `frac` of CA atoms. Returns core RMSD and per-residue deviations."""
+    P, Q = ref.coord[ref.atom_name == "CA"], pred.coord[pred.atom_name == "CA"]
+    if len(P) != len(Q):
+        return np.nan, None
+    idx = np.arange(len(P))
+    for _ in range(iters):
+        p0, q0 = P[idx].mean(0), Q[idx].mean(0)
+        U, _, Vt = np.linalg.svd((Q[idx] - q0).T @ (P[idx] - p0))
+        D = np.diag([1, 1, np.sign(np.linalg.det(U @ Vt))])
+        d = np.linalg.norm((Q - q0) @ U @ D @ Vt + p0 - P, axis=1)
+        idx = np.argsort(d)[: int(frac * len(P))]
+    return np.sqrt(np.mean(d[idx] ** 2)), d
+
+
 def worst_residues(ref, pred, k=5):
     ca_r, ca_p = ref[ref.atom_name == "CA"], pred[pred.atom_name == "CA"]
     if len(ca_r) != len(ca_p):
@@ -79,7 +94,7 @@ def main():
     ap.add_argument("--out", default="out/stage3a_check.png")
     a = ap.parse_args()
     ref = bio.load_structure(a.ref)
-    fig, ax = plt.subplots(2, 3, figsize=(16, 9))
+    fig, ax = plt.subplots(2, 4, figsize=(21, 9))
 
     # 1. traces
     for run in a.runs:
@@ -115,6 +130,11 @@ def main():
         print(f"  {lab}\n    CA RMSD {rp:.2f} A (mirror {rm:.2f} A)   global {-g:.3e}   whitened {-w:.3e}")
         print(f"    radius: Rg {radius(pred)[0]:.2f} A, max {radius(pred)[1]:.2f} A   (x*: Rg {radius(ref)[0]:.2f}, max {radius(ref)[1]:.2f})")
         print(f"    largest CA deviations (res_id: A): {worst_residues(ref, pred)}")
+        rc, dev = core_fit(ref, pred)
+        if dev is not None:
+            print(f"    80%-core RMSD {rc:.2f} A; after core fit, residues within 2/4/8 A: "
+                  + " / ".join(f"{(dev < c).mean():.0%}" for c in (2, 4, 8)))
+            ax[1, 3].plot(ref.res_id[ref.atom_name == "CA"], dev, lw=0.8, label=f"{lab[:25]} (core {rc:.1f} A)")
         for j, (val, mk) in enumerate([(-g, "-"), (-w, ":")]):
             ax[1, 0].axhline(val, color=f"C{k + 2}", ls=mk, lw=1, label=f"{lab[:25]} {'global' if j == 0 else 'whitened'}")
         ax[1, 1].semilogy(per_l, label=f"{lab[:25]} ({rp:.1f} A)")
@@ -122,6 +142,8 @@ def main():
     ax[1, 0].set(title="sensitivity: -score of x* + noise (lines: predictions)", xlabel="per-atom noise sigma (A)")
     ax[1, 1].set(title="whitened relative error of C_l", xlabel="degree l")
     ax[1, 2].set(title="CA RMSD to x* (A)", xticks=[])
+    ax[1, 3].set(title="per-residue CA deviation after 80%-core fit (A)", xlabel="res_id (x*)", yscale="log")
+    ax[0, 3].axis("off")
     for axi in ax[1]:
         axi.legend(fontsize=6)
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
