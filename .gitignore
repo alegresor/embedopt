@@ -8,6 +8,7 @@ stage3a_cfgs/
 *.json
 *.csv
 *.png 
+*.map
 
 # Output and log folders
 *_output*/

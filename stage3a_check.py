@@ -86,7 +86,7 @@ def scores(rew, x):
     return g, -per_l.mean(), per_l
 
 
-def main():
+def run_checks():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ref", required=True)
     ap.add_argument("--runs", nargs="+", required=True)
@@ -153,4 +153,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_checks()
