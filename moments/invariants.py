@@ -15,6 +15,7 @@ Both are exactly invariant to rotations and reflections of x. Quadratures on S^2
 trapezoid rules, exact for degree <= 2L+1.
 """
 
+import contextlib
 import functools
 
 import biotite.structure as bs
@@ -29,6 +30,19 @@ def sph_harm(l, m, theta, phi):  # theta polar, phi azimuth; handles old/new sci
     import scipy.special as sp
 
     return sp.sph_harm_y(l, m, theta, phi) if hasattr(sp, "sph_harm_y") else sp.sph_harm(m, l, phi, theta)
+
+
+@contextlib.contextmanager
+def full_precision():
+    """Exact float32 matmuls: no TF32 (Protenix enables it globally) and no autocast. The bispectrum blocks are sums
+    with heavy cancellation, and per-block normalization amplifies TF32's ~1e-3 relative error into O(1e-2) losses."""
+    flags = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False
+    try:
+        with torch.autocast("cuda", enabled=False):
+            yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = flags
 
 
 @functools.lru_cache(maxsize=4)
@@ -94,6 +108,10 @@ class Invariants:
 
     def coefficients(self, x, rho):
         """x: (N, 3) centered, rho: (N, N_kappa). Returns A: (N_kappa, (L+1)^2)."""
+        with full_precision():
+            return self._coefficients(x.float(), rho)
+
+    def _coefficients(self, x, rho):
         # One shell at a time, checkpointed: the (N, Nq) phase arrays are recomputed in the backward pass instead of
         # stored for all shells (memory ~ 1 shell instead of N_kappa shells, ~30% more time)
         V = torch.stack([checkpoint(_shell, x, self.omega, rho[:, i], k, use_reentrant=False)
@@ -102,10 +120,15 @@ class Invariants:
 
     def power(self, A):
         """a0 (N_kappa,), [C_l (N_kappa, N_kappa) for l = 0..L]."""
-        return A[:, 0], [A[:, l * l:(l + 1) ** 2] @ A[:, l * l:(l + 1) ** 2].conj().T for l in range(self.L + 1)]
+        with full_precision():
+            return A[:, 0], [A[:, l * l:(l + 1) ** 2] @ A[:, l * l:(l + 1) ** 2].conj().T for l in range(self.L + 1)]
 
     def bispectrum(self, A, chunk=512):
         """G as a real tensor of shape (LB+1, LB+1, LB+1, S, S, S) over (l1, l2, l3, shell a, shell b, shell c)."""
+        with full_precision():
+            return self._bispectrum(A, chunk)
+
+    def _bispectrum(self, A, chunk):
         LB, S = self.LB, len(self.shells)
         A = A[self.shells, : (LB + 1) ** 2] * self.phase  # (S, (LB+1)^2)
         F = torch.stack([(A[:, l * l:(l + 1) ** 2] @ self.Y2[:, l * l:(l + 1) ** 2].T).real for l in range(LB + 1)])
@@ -118,9 +141,11 @@ class Invariants:
 def _shell(x, omega, r, k):
     """Vhat on the nodes of one shell: sum_n r_n exp(-2 pi i k omega . q_n), via real cos/sin (complex exp is
     JIT-compiled through NVRTC in torch)."""
-    phase = (2 * np.pi * k) * (x @ omega.T)
-    return torch.complex(r @ torch.cos(phase), -(r @ torch.sin(phase)))
+    with full_precision():  # also applies when the checkpoint recomputes this in the backward pass
+        phase = (2 * np.pi * k) * (x @ omega.T)
+        return torch.complex(r @ torch.cos(phase), -(r @ torch.sin(phase)))
 
 
 def _triple(F, w):
-    return torch.einsum("xq,yq,zq->xyz", F * w, F, F)
+    with full_precision():
+        return torch.einsum("xq,yq,zq->xyz", F * w, F, F)

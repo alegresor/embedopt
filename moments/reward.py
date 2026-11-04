@@ -68,7 +68,7 @@ class OracleMomentReward(Reward):
             self.a0_ref, self.C_ref = self.inv.power(A_ref)
             G = self.inv.bispectrum(A_ref)
             n = G.pow(2).sum(dim=(3, 4, 5))
-            self.blocks = n > 1e-8 * n.max()  # nonzero degree triples (triangle rule, even l1+l2+l3), was 1e-12; keeps blocks well above float32 rounding
+            self.blocks = n > 1e-12 * n.max()  # nonzero degree triples (triangle rule, even l1+l2+l3)
             self.G_ref, self.G_ref_norm = G, n
             # Checks: invariance to a rotation and to the reflection; Kam scramble (odd degrees from a rotated copy)
             # leaves m12 unchanged but should change m3
@@ -82,7 +82,8 @@ class OracleMomentReward(Reward):
         logger.info(f"[OracleMoment] order {self.order}, {len(order_idx)} matched atoms (dropped {(~keep).sum()} model, "
                     f"{len(ref) - len(order_idx)} ref incl. H), L={self.inv.L}, {len(self.inv.omega)} S^2 nodes, "
                     f"{len(self.inv.kappa)} shells; bispectrum LB={self.inv.LB}, {len(self.inv.shells)} shells, "
-                    f"{int(self.blocks.sum())} blocks, {len(self.inv.w2)} nodes; checks: {chk}")
+                    f"{int(self.blocks.sum())} blocks, {len(self.inv.w2)} nodes; checks: {chk} "
+                    f"(global TF32 matmul flag outside the reward: {torch.backends.cuda.matmul.allow_tf32})")
 
     def m12(self, A):
         a0, C = self.inv.power(A)
