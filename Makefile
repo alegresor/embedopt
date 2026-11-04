@@ -1,11 +1,13 @@
 # Usage:
 #   make cfg SYSTEM=8AHU_A                        # x*, MSA and the base JSON config for SYSTEM
 #   make maps                                     # 5 A synthetic maps for all systems (needed by METHOD=map)
-#   make run SYSTEM=8K9Z_A METHOD=moment ORDER=3 LR=0.1 [RES=4.0]
+#   make run SYSTEM=8K9Z_A METHOD=moment ORDER=3 LR=0.1 [DW=1] [RES=4.0]
 #   make check SYSTEM=8K9Z_A                      # summary table + CSV + figure over all runs in out/$(SYSTEM)/
+#   make check SYSTEM=8K9Z_A FIG=check_dw RUNS="base map_lr0.5 moment3_lr0.1 moment3dw_lr0.1"   # subset figure
 #
 # METHOD=base   : unguided Protenix (second-order moment loss logged only)     -> out/$(SYSTEM)/base
-# METHOD=moment : EmbedOpt + oracle uniform-mu moments of order ORDER (2 or 3)  -> out/$(SYSTEM)/moment<ORDER>_lr<LR>[_res<RES>]
+# METHOD=moment : EmbedOpt + oracle uniform-mu moments of order ORDER (2 or 3)  -> out/$(SYSTEM)/moment<ORDER>[dw]_lr<LR>[_res<RES>]
+#                 DW=1 weights the moment losses by the denoiser's posterior positional uncertainty (Debye-Waller)
 # METHOD=map    : EmbedOpt + Li et al.'s MapReward on the 5 A synthetic map      -> out/$(SYSTEM)/map_lr<LR>
 BENCH      ?= examples/synthetic_map_benchmark
 SYSTEM     ?= 8AHU_A
@@ -16,6 +18,9 @@ RES        ?= 5.0
 LB         ?= 24
 LAMBDA3    ?= 1.0
 NKAPPA     ?= 16
+DW         ?= 0
+FIG        ?= check
+RUNS       ?=
 CFG        ?= $(BENCH)/stage3a_cfgs/$(SYSTEM)_benchmark.json
 MODEL      ?= protenix_base_default_v0.5.0
 CKPT_DIR   ?= $(HOME)/.cache/protenix/checkpoint
@@ -25,10 +30,10 @@ SEEDS      ?= 101,102,103,104,105
 export LAYERNORM_TYPE := torch_layernorm
 
 RES_TAG    = $(if $(filter 5.0,$(RES)),,_res$(RES))
-RUN_NAME   = $(if $(filter base,$(METHOD)),base,$(if $(filter map,$(METHOD)),map_lr$(LR),moment$(ORDER)_lr$(LR)$(RES_TAG)))
+RUN_NAME   = $(if $(filter base,$(METHOD)),base,$(if $(filter map,$(METHOD)),map_lr$(LR),moment$(ORDER)$(if $(filter 1,$(DW)),dw,)_lr$(LR)$(RES_TAG)))
 RUN_CFG    = $(BENCH)/stage3a_cfgs/$(SYSTEM)_$(RUN_NAME).json
-MOMENT_ENV = MOMENT_LB=$(LB) MOMENT_LAMBDA3=$(LAMBDA3) MOMENT_NKAPPA=$(NKAPPA)
-ENTRY_base   = MOMENT_ORDER=2 $(MOMENT_ENV) python -m moments.reward
+MOMENT_ENV = MOMENT_DW=$(DW) MOMENT_LB=$(LB) MOMENT_LAMBDA3=$(LAMBDA3) MOMENT_NKAPPA=$(NKAPPA)
+ENTRY_base   = MOMENT_ORDER=2 MOMENT_DW=0 MOMENT_LB=$(LB) MOMENT_NKAPPA=$(NKAPPA) python -m moments.reward
 ENTRY_moment = MOMENT_ORDER=$(ORDER) $(MOMENT_ENV) python -m moments.reward
 ENTRY_map    = python -m embedopt.inference.inference
 
@@ -49,8 +54,8 @@ run:
 
 check:
 	python -m moments.check --ref $(BENCH)/pdb_clean/$(SYSTEM).pdb \
-	       --runs $(sort $(wildcard out/$(SYSTEM)/base out/$(SYSTEM)/map_lr* out/$(SYSTEM)/moment*_lr*)) \
-	       --out out/$(SYSTEM)/check.png --csv out/$(SYSTEM)/summary.csv
+	       --runs $(if $(RUNS),$(addprefix out/$(SYSTEM)/,$(RUNS)),$(sort $(wildcard out/$(SYSTEM)/base out/$(SYSTEM)/map_lr* out/$(SYSTEM)/moment*_lr*))) \
+	       --out out/$(SYSTEM)/$(FIG).png --csv out/$(SYSTEM)/$(if $(RUNS),$(FIG),summary).csv
 
 maps:
 	python $(BENCH)/04_generate_map.py

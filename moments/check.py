@@ -1,12 +1,12 @@
-"""Analysis of oracle-moment experiments: one row per final prediction, aggregated per run
-(base / map_lr* / moment2_lr* / moment3_lr*[_res*]).
+"""Analysis of oracle-moment experiments: one row per final prediction, aggregated per run.
 
-Per prediction: CA RMSD to x* (and mirrored), 80%-core RMSD, fraction of residues within 2/4/8 A after the core fit,
-Rg and max radius, and, scored identically for every run (5 A, default bispectrum settings): the second-order moment
-loss m12, the third-order bispectrum loss m3, and the whitened per-degree error of C_l.
-Outputs: a printed per-run summary (median [min, max] and success rates), a CSV with every row, and a figure.
+Runs: base, map_lr*, moment{2,3}[dw]_lr*[_res*]. Every prediction is scored identically (5 A, default bispectrum
+settings, no Debye-Waller weighting): CA RMSD to x* (and mirrored), 80%-core RMSD, fraction of residues within 2/4/8 A
+after the core fit, Rg, max radius, second-order loss m12 and third-order loss m3.
+Figure: colors distinguish runs, line styles / markers distinguish methods (base, map, moment2, moment3; DW runs bold).
+Per-step traces (t, s_t, m12, m3, RMSD) come from moment_trace.json, written by moment runs.
 
-Usage: python -m moments.check --ref <x*.pdb> --runs out/SYS/base out/SYS/moment2_lr0.1 ... --out fig.png --csv rows.csv
+Usage: python -m moments.check --ref <x*.pdb> --runs out/SYS/base out/SYS/moment3_lr0.1 ... --out fig.png --csv rows.csv
 """
 
 import argparse
@@ -26,7 +26,13 @@ import torch
 from moments.reward import OracleMomentReward
 
 SIGMAS = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
-SUCCESS = {"rmsd<5": ("rmsd", 5.0), "core<2": ("core", 2.0)}  # success-rate definitions (A)
+DW_WIDTHS = [0.0, 2.0, 4.0, 8.0]  # posterior widths s for the basin test
+SUCCESS = {"rmsd<5": ("rmsd", 5.0), "core<2": ("core", 2.0)}
+STYLE = {"base": ("-", "x"), "map": ("-", "o"), "moment2": ("--", "s"), "moment3": (":", "^")}
+
+
+def method(run):
+    return next(k for k in ("moment2", "moment3", "map", "base") if run.startswith(k))
 
 
 def ca(a):
@@ -60,15 +66,9 @@ def structure_metrics(ref, pred, frac=0.8, iters=20):
 
 
 @torch.no_grad()
-def scores(rew, x):
-    """x: (N_atom, 3) in model order. Returns m12, m3, whitened per-degree errors of C_l."""
-    x = torch.as_tensor(x, dtype=torch.float32, device=rew.dev)[rew.keep]
-    A = rew.inv.coefficients(x - x.mean(0), rew.rho)
-    _, C = rew.inv.power(A)
-    d = 1 / sum(cr.diagonal().real for cr in rew.C_ref).sqrt()  # whitening by the radial power of x*
-    D = d[:, None] * d[None, :]
-    per_l = np.array([((D * (c - cr)).abs().pow(2).sum() / (D * cr).abs().pow(2).sum()).item() for c, cr in zip(C, rew.C_ref)])
-    return rew.m12(A).item(), rew.m3(A).item(), per_l
+def losses(rew, x, s=0.0):
+    m12, m3 = rew.losses(torch.as_tensor(x, dtype=torch.float32, device=rew.dev), s)
+    return m12.item(), m3.item()
 
 
 def run_checks():
@@ -80,48 +80,42 @@ def run_checks():
     ap.add_argument("--csv", default="out/summary.csv")
     a = ap.parse_args()
     ref = bio.load_structure(a.ref)
-    runs = [r.rstrip("/") for r in a.runs]
-    color = {os.path.basename(r): f"C{i}" for i, r in enumerate(runs)}
-    fig, ax = plt.subplots(2, 4, figsize=(22, 10))
-
-    # Traces (map runs log the map reward, not the moment loss: different scale)
-    for run in runs:
-        g = os.path.basename(run)
-        for i, f in enumerate(sorted(glob.glob(f"{run}/**/reward_history.json", recursive=True))):
-            h = json.load(open(f))
-            step = [e["step"] for e in h]
-            ax[0, 0].semilogy(step, [-e["reward"] for e in h], color=color[g], lw=0.6, label=g if i == 0 else None)
-
-    ax[0, 0].set(title="loss as optimized (moment2: m12, moment3: m12 m3^lambda, map: -map reward)", xlabel="diffusion step")
-    ax[0, 1].set(title="does m3 predict accuracy?", xlabel="m3 (bispectrum loss)", ylabel="80%-core RMSD (A)")
-
-    # Sensitivity of the moment loss to per-atom noise on x*
-    rew_ref = OracleMomentReward(a.ref, ref, resolution=a.resolution, order=3)
+    runs = [r.rstrip("/") for r in a.runs if os.path.isdir(r)]
+    names = [os.path.basename(r) for r in runs]
+    cmap = plt.get_cmap("tab20" if len(runs) > 10 else "tab10")
+    color = {g: cmap(i % cmap.N) for i, g in enumerate(names)}
+    sty = lambda g: dict(color=color[g], ls=STYLE[method(g)][0], lw=2.0 if "dw" in g else 1.2)
+    fig, ax = plt.subplots(3, 4, figsize=(24, 15))
     rng = np.random.default_rng(0)
-    sens = np.array([scores(rew_ref, ref.coord + s * rng.standard_normal(ref.coord.shape))[:2] for s in SIGMAS])
-    ax[1, 0].loglog(SIGMAS, sens[:, 0], "ko-", label="m12: x* + noise")
-    ax[1, 0].loglog(SIGMAS, sens[:, 1], "ks--", label="m3: x* + noise")
-    print("\nSensitivity (x* + per-atom noise):")
-    for s, (m12_, m3_) in zip(SIGMAS, sens):
-        print(f"  sigma {s:5.2f} A   m12 {m12_:.3e}   m3 {m3_:.3e}")
+
+    # Sensitivity and Debye-Waller basin test on x* + per-atom noise
+    rew_ref = OracleMomentReward(a.ref, ref, resolution=a.resolution, order=3, dw=False)
+    noisy = [ref.coord + s * rng.standard_normal(ref.coord.shape) for s in SIGMAS]
+    print("\nSensitivity (x* + per-atom noise), unweighted and with Debye-Waller width s:")
+    for s in DW_WIDTHS:
+        v = np.array([losses(rew_ref, x, s) for x in noisy])
+        print(f"  s = {s:4.1f} A   m12: " + " ".join(f"{u:.1e}" for u in v[:, 0]) + "   m3: " + " ".join(f"{u:.1e}" for u in v[:, 1]))
+        ax[1, 0].loglog(SIGMAS, v[:, 1] / v[0, 1], "s-", label=f"m3, s = {s:g} A")
+        if s == 0:
+            sens = v
+    print(f"  (columns: sigma = {SIGMAS} A)")
+    ax[1, 0].set(title="basin test: m3(x* + noise) / m3(x* + 0.25 A), by DW width s", xlabel="per-atom noise sigma (A)")
 
     # Final predictions; one scoring reward for all (Protenix atom order is identical across runs and seeds)
-    rows, per_l_all, dev_all, rew_pred, n_atom = [], {}, {}, None, None
-    for run in runs:
-        g = os.path.basename(run)
+    rows, dev_all, rew_pred, n_atom = [], {}, None, None
+    for run, g in zip(runs, names):
         for f in sorted(glob.glob(f"{run}/**/predictions/*.cif", recursive=True)):
             pred = bio.load_structure(f)
             if rew_pred is None or len(pred) != n_atom:
-                rew_pred, n_atom = OracleMomentReward(a.ref, pred, resolution=a.resolution, order=3), len(pred)
+                rew_pred, n_atom = OracleMomentReward(a.ref, pred, resolution=a.resolution, order=3, dw=False), len(pred)
             sm = structure_metrics(ref, pred)
             if sm is None:
                 print(f"  skipping {f}: CA count mismatch")
                 continue
             m, dev = sm
-            m12, m3, per_l = scores(rew_pred, pred.coord)
+            m12, m3 = losses(rew_pred, pred.coord)
             seed = next((p for p in f.split(os.sep) if p.startswith("seed_")), "?")
             rows.append(dict(run=g, seed=seed, m12=m12, m3=m3, **m))
-            per_l_all.setdefault(g, []).append(per_l)
             dev_all.setdefault(g, []).append(dev)
     df = pd.DataFrame(rows)
     for name, (col, thr) in SUCCESS.items():
@@ -130,43 +124,68 @@ def run_checks():
     df.to_csv(a.csv, index=False)
 
     # Summary table
-    order = [os.path.basename(r) for r in runs if os.path.basename(r) in set(df.run)]
+    order = [g for g in names if g in set(df.run)]
     print(f"\nx*: Rg {structure_metrics(ref, ref)[0]['rg']:.2f} A\n")
     fmt = lambda s: f"{s.median():6.2f} [{s.min():5.2f}, {s.max():5.2f}]"
-    print(f"{'run':<20}{'n':>3}  {'RMSD med [min,max]':<22}{'core med [min,max]':<22}{'within 2A':>10}{'Rg':>7}"
+    print(f"{'run':<22}{'n':>3}  {'RMSD med [min,max]':<22}{'core med [min,max]':<22}{'within 2A':>10}{'Rg':>7}"
           f"{'m12':>11}{'m3':>11}{'rmsd<5':>8}{'core<2':>8}")
     for g in order:
         d = df[df.run == g]
-        print(f"{g:<20}{len(d):>3}  {fmt(d.rmsd):<22}{fmt(d.core):<22}{d.within2.median():>9.0%}{d.rg.median():>7.1f}"
+        print(f"{g:<22}{len(d):>3}  {fmt(d.rmsd):<22}{fmt(d.core):<22}{d.within2.median():>9.0%}{d.rg.median():>7.1f}"
               f"{d.m12.median():>11.2e}{d.m3.median():>11.2e}{d['rmsd<5'].mean():>8.0%}{d['core<2'].mean():>8.0%}")
     print(f"\nRows written to {a.csv}")
 
-    # Aggregate panels
-    for j, (col, title) in enumerate([("rmsd", "CA RMSD to x* (A)"), ("core", "80%-core RMSD (A)")]):
-        axi = ax[0, 2 + j]
+    # Row 0: reward as optimized, accuracy distributions
+    for run, g in zip(runs, names):
+        for i, f in enumerate(sorted(glob.glob(f"{run}/**/reward_history.json", recursive=True))):
+            h = json.load(open(f))
+            ax[0, 0].semilogy([e["step"] for e in h], [abs(e["reward"]) for e in h], alpha=0.6, label=g if i == 0 else None, **sty(g))
+    ax[0, 0].set(title="|reward| as optimized (map runs: map reward)", xlabel="diffusion step")
+    for j, (col, title) in enumerate([("rmsd", "CA RMSD to x* (A)"), ("core", "80%-core RMSD (A)"), ("within2", "fraction within 2 A")]):
+        axi = ax[0, 1 + j]
         axi.boxplot([df[df.run == g][col] for g in order], showfliers=False)
-        axi.set_xticks(range(1, len(order) + 1), order, rotation=45)
+        axi.set_xticks(range(1, len(order) + 1), order, rotation=60, fontsize=8)
         for i, g in enumerate(order):
             v = df[df.run == g][col]
-            axi.scatter(np.full(len(v), i + 1) + 0.08 * rng.standard_normal(len(v)), v, s=12, color=color[g], zorder=3)
+            axi.scatter(np.full(len(v), i + 1) + 0.08 * rng.standard_normal(len(v)), v, s=14, color=color[g],
+                        marker=STYLE[method(g)][1], zorder=3)
         axi.set(title=title)
+
+    # Row 1: sensitivity (above), per-residue deviation, loss vs accuracy
     for g in order:
         d = df[df.run == g]
-        ax[1, 0].scatter(np.full(len(d), SIGMAS[-1] * 1.3), d.m12, s=10, color=color[g], label=g)
-        ax[1, 0].scatter(np.full(len(d), SIGMAS[-1] * 1.6), d.m3, s=10, color=color[g], marker="s")
-        ax[1, 1].semilogy(np.median(per_l_all[g], axis=0), color=color[g], label=g)
-        ax[1, 2].semilogy(ref.res_id[ref.atom_name == "CA"], np.median(dev_all[g], axis=0), color=color[g], lw=0.8, label=g)
-        ax[1, 3].loglog(d.m12, d.core, "o", color=color[g], ms=4, label=g)
-        ax[0, 1].loglog(d.m3, d.core, "s", color=color[g], ms=4, label=g)
-    ax[1, 0].set(title="m12 (o) and m3 (s): x* + noise vs predictions (right)", xlabel="per-atom noise sigma (A)")
-    ax[1, 1].set(title="median whitened relative error of C_l", xlabel="degree l")
-    ax[1, 2].set(title="median per-residue CA deviation after core fit (A)", xlabel="res_id (x*)")
-    ax[1, 3].set(title="does m12 predict accuracy?", xlabel="m12 (second-order loss)", ylabel="80%-core RMSD (A)")
+        mk = STYLE[method(g)][1]
+        ax[1, 1].semilogy(ref.res_id[ref.atom_name == "CA"], np.median(dev_all[g], axis=0), label=g, **{**sty(g), "lw": 0.9})
+        ax[1, 2].loglog(d.m12, d.core, mk, color=color[g], ms=5, label=g)
+        ax[1, 3].loglog(d.m3, d.core, mk, color=color[g], ms=5, label=g)
+    for v, axi in zip(sens[:, 0], [ax[1, 2]] * len(SIGMAS)):
+        axi.axvline(v, color="0.85", lw=0.8, zorder=0)
+    for v in sens[:, 1]:
+        ax[1, 3].axvline(v, color="0.85", lw=0.8, zorder=0)
+    ax[1, 1].set(title="median per-residue CA deviation after core fit (A)", xlabel="res_id (x*)")
+    ax[1, 2].set(title="does m12 predict accuracy? (grey: x* + 0.25..8 A noise)", xlabel="m12", ylabel="80%-core RMSD (A)")
+    ax[1, 3].set(title="does m3 predict accuracy? (grey: x* + 0.25..8 A noise)", xlabel="m3", ylabel="80%-core RMSD (A)")
+
+    # Row 2: per-step traces from moment runs (median over seeds)
+    for run, g in zip(runs, names):
+        tr = [json.load(open(f)) for f in sorted(glob.glob(f"{run}/**/moment_trace.json", recursive=True))]
+        if not tr:
+            continue
+        n = min(len(t) for t in tr)
+        for j, key in enumerate(["m12", "m3", "rmsd"]):
+            if tr[0][0][key] is None:
+                continue
+            M = np.median([[t[k][key] for k in range(n)] for t in tr], axis=0)
+            ax[2, j].semilogy(range(n), M, label=g, **sty(g)) if key != "rmsd" else ax[2, j].plot(range(n), M, label=g, **sty(g))
+        ax[2, 3].semilogy(range(n), [max(tr[0][k]["s"], 1e-3) for k in range(n)], label=g, **sty(g))
+    for j, t in enumerate(["median m12 along the trajectory (as optimized)", "median m3 along the trajectory (as optimized)",
+                           "median CA RMSD to x* along the trajectory (A)", "DW posterior width s_t (A)"]):
+        ax[2, j].set(title=t, xlabel="diffusion step")
     for axi in ax.ravel():
         if axi.get_legend_handles_labels()[0]:
             axi.legend(fontsize=7)
     fig.tight_layout()
-    fig.savefig(a.out, dpi=130)
+    fig.savefig(a.out, dpi=120)
     print(f"Saved {a.out}")
 
 
