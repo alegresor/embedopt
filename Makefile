@@ -13,6 +13,7 @@
 # METHOD=moment : EmbedOpt + oracle uniform-mu moments of order ORDER (2 or 3)  -> out/$(SYSTEM)/moment<ORDER>[dw]_lr<LR>[_res<RES>]
 #                 DW=1 weights the moment losses by the denoiser's posterior positional uncertainty (Debye-Waller)
 # METHOD=map    : EmbedOpt + Li et al.'s MapReward on the 5 A synthetic map      -> out/$(SYSTEM)/map_lr<LR>
+#                 (moments.map_entry = their entry point + optional partial diffusion)
 BENCH      ?= examples/synthetic_map_benchmark
 SYSTEM     ?= 8AHU_A
 METHOD     ?= moment
@@ -45,7 +46,7 @@ PARTIAL_ENV = $(if $(INIT),PARTIAL_INIT=$(abspath $(INIT)) PARTIAL_SIGMA=$(SIGMA
 MOMENT_ENV = $(PARTIAL_ENV) MOMENT_DW=$(DW) MOMENT_LB=$(LB) MOMENT_LAMBDA3=$(LAMBDA3) MOMENT_NKAPPA=$(NKAPPA)
 ENTRY_base   = MOMENT_ORDER=2 MOMENT_DW=0 MOMENT_LB=$(LB) MOMENT_NKAPPA=$(NKAPPA) python -m moments.reward
 ENTRY_moment = MOMENT_ORDER=$(ORDER) $(MOMENT_ENV) python -m moments.reward
-ENTRY_map    = python -m embedopt.inference.inference
+ENTRY_map    = $(PARTIAL_ENV) python -m moments.map_entry
 
 RUN_ARGS = --dump_dir out/$(SYSTEM)/$(RUN_NAME) --model_name $(MODEL) \
            --load_checkpoint_dir $(CKPT_DIR) --use_template false \

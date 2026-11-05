@@ -29,7 +29,7 @@ for S in $SIGMAS; do
     done
 done
 
-SEQ=$( (ls -d out/$SYS/moment[23]_lr0.1_seq* 2>/dev/null || true) | xargs -r -n1 basename | sort -t q -k2 -n)
+SEQ=$( (ls -d out/$SYS/moment[23]_lr0.1_seq*/ 2>/dev/null || true) | xargs -r -n1 basename | grep -v "_seq[0-9]*_seq" | sort -t q -k2 -n)
 make check SYSTEM=$SYS FIG=check_seq RUNS="base map_lr0.5 moment2_lr0.1 moment3_lr0.1 $SEQ" 2>&1 | tee out/$SYS/check_seq.log
 
 # Paired per-seed comparison (core RMSD, A): each arm vs pass 1, and moment3 vs moment2 at the same restart level
