@@ -4,6 +4,8 @@
 #   make run SYSTEM=8K9Z_A METHOD=moment ORDER=3 LR=0.1 [DW=1] [RES=4.0]
 #   make check SYSTEM=8K9Z_A                      # summary table + CSV + figure over all runs in out/$(SYSTEM)/
 #   make check SYSTEM=8K9Z_A FIG=check_dw RUNS="base map_lr0.5 moment3_lr0.1 moment3dw_lr0.1"   # subset figure
+#   SAVE_EMB=1 saves the final optimized embedding; WARM=<embeddings_step_*.pt> starts from a saved embedding;
+#   TAG=_suffix is appended to the run name (e.g. TAG=_warm)
 #
 # METHOD=base   : unguided Protenix (second-order moment loss logged only)     -> out/$(SYSTEM)/base
 # METHOD=moment : EmbedOpt + oracle uniform-mu moments of order ORDER (2 or 3)  -> out/$(SYSTEM)/moment<ORDER>[dw]_lr<LR>[_res<RES>]
@@ -21,6 +23,9 @@ NKAPPA     ?= 16
 DW         ?= 0
 FIG        ?= check
 RUNS       ?=
+TAG        ?=
+WARM       ?=
+SAVE_EMB   ?= 0
 CFG        ?= $(BENCH)/stage3a_cfgs/$(SYSTEM)_benchmark.json
 MODEL      ?= protenix_base_default_v0.5.0
 CKPT_DIR   ?= $(HOME)/.cache/protenix/checkpoint
@@ -30,7 +35,7 @@ SEEDS      ?= 101,102,103,104,105
 export LAYERNORM_TYPE := torch_layernorm
 
 RES_TAG    = $(if $(filter 5.0,$(RES)),,_res$(RES))
-RUN_NAME   = $(if $(filter base,$(METHOD)),base,$(if $(filter map,$(METHOD)),map_lr$(LR),moment$(ORDER)$(if $(filter 1,$(DW)),dw,)_lr$(LR)$(RES_TAG)))
+RUN_NAME   = $(if $(filter base,$(METHOD)),base,$(if $(filter map,$(METHOD)),map_lr$(LR),moment$(ORDER)$(if $(filter 1,$(DW)),dw,)_lr$(LR)$(RES_TAG)))$(TAG)
 RUN_CFG    = $(BENCH)/stage3a_cfgs/$(SYSTEM)_$(RUN_NAME).json
 MOMENT_ENV = MOMENT_DW=$(DW) MOMENT_LB=$(LB) MOMENT_LAMBDA3=$(LAMBDA3) MOMENT_NKAPPA=$(NKAPPA)
 ENTRY_base   = MOMENT_ORDER=2 MOMENT_DW=0 MOMENT_LB=$(LB) MOMENT_NKAPPA=$(NKAPPA) python -m moments.reward
@@ -49,7 +54,11 @@ run:
 	j['algorithm'] = {'type': 'base', 'params': {}} if '$(METHOD)' == 'base' else \
 	{'type': 'embedopt', 'params': {'reward_scale_s': $(LR), 'reward_scale_z': $(LR)}}; \
 	j['reward']['params']['resolution'] = 5.0 if '$(METHOD)' == 'map' else $(RES); \
+	p = j['algorithm']['params']; \
+	p.update({'override_embeddings_path': '$(abspath $(WARM))'} if '$(WARM)' else {}); \
+	p.update({'save_embeddings_every_n_steps': -1} if '$(SAVE_EMB)' == '1' else {}); \
 	json.dump([j], open('$(RUN_CFG)', 'w'), indent=2)"
+	$(if $(WARM),test -f $(WARM) || (echo 'missing WARM embedding: $(WARM)'; exit 1),true)
 	$(ENTRY_$(METHOD)) --input_json_path $(RUN_CFG) $(RUN_ARGS)
 
 check:
