@@ -53,7 +53,7 @@ RUN_ARGS = --dump_dir out/$(SYSTEM)/$(RUN_NAME) --model_name $(MODEL) \
            --enable_diffusion_shared_vars_cache false \
            --sample_diffusion.N_step $(N_STEP) --seeds $(SEEDS)
 
-.PHONY: cfg maps run check
+.PHONY: cfg maps run check imagechecks
 
 run:
 	python -c "import json; j = json.load(open('$(CFG)'))[0]; j['name'] = '$(SYSTEM)_$(RUN_NAME)'; \
@@ -75,6 +75,12 @@ check:
 
 maps:
 	python $(BENCH)/04_generate_map.py
+
+# Unit checks for image-based moments (oracle particle, uniform poses): out/<SYS>/image_checks.{json,png}
+IC_SYSTEMS ?= 8AHU_A 8K9Z_A 8H1I_A
+NMAX       ?= 1000000
+imagechecks:
+	python -m moments.image_checks --systems $(IC_SYSTEMS) --nmax $(NMAX) 2>&1 | tee out/image_checks.log
 
 # Their synthetic-benchmark pipeline (all 77 x*/minimal JSONs are cheap), MSA for SYSTEM only
 cfg:
