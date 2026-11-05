@@ -5,6 +5,7 @@
 #   make check SYSTEM=8K9Z_A                      # summary table + CSV + figure over all runs in out/$(SYSTEM)/
 #   make check SYSTEM=8K9Z_A FIG=check_dw RUNS="base map_lr0.5 moment3_lr0.1 moment3dw_lr0.1"   # subset figure
 #   INIT=<structure.cif> SIGMA0=<A> runs partial diffusion: start from INIT noised to SIGMA0, run the remaining steps;
+#   INIT may contain {seed} and wildcards (per-seed start, e.g. from a previous run's predictions);
 #   SAVE_EMB=1 saves the final optimized embedding; WARM=<embeddings_step_*.pt> starts from a saved embedding;
 #   TAG=_suffix is appended to the run name (e.g. TAG=_warm)
 #
@@ -63,7 +64,7 @@ run:
 	p.update({'save_embeddings_every_n_steps': -1} if '$(SAVE_EMB)' == '1' else {}); \
 	json.dump([j], open('$(RUN_CFG)', 'w'), indent=2)"
 	$(if $(WARM),test -f $(WARM) || (echo 'missing WARM embedding: $(WARM)'; exit 1),true)
-	$(if $(INIT),test -f $(INIT) || (echo 'missing INIT structure: $(INIT)'; exit 1),true)
+	$(if $(INIT),$(if $(findstring {seed},$(INIT)),true,test -f $(INIT) || (echo 'missing INIT structure: $(INIT)'; exit 1)),true)
 	$(ENTRY_$(METHOD)) --input_json_path $(RUN_CFG) $(RUN_ARGS)
 
 check:

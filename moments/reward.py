@@ -26,6 +26,7 @@ Usage: python -m moments.reward <embedopt.inference CLI>, with a config whose re
 
 import json
 import os
+import re
 
 import numpy as np
 import torch
@@ -39,6 +40,7 @@ from moments.invariants import Invariants, form_factors, match_atoms
 logger = get_logger(__name__)
 
 NOISE = {"t": None, "sigma_data": None}  # set by the DiffusionModule hook at every denoiser call
+CURRENT = {"seed": None}  # seed of the trajectory being sampled (parsed from the runner's output dir)
 R_SAFETY = 1.2  # r_max = R_SAFETY * radius of x* (x0 may be less compact early on)
 B_FACTOR = 50.0
 
@@ -75,6 +77,8 @@ class OracleMomentReward(Reward):
         self.order = order or env("MOMENT_ORDER", 2, int)
         self.dw = bool(env("MOMENT_DW", 0, int)) if dw is None else dw
         self.trace_path = os.path.join(output_dir, "moment_trace.json") if output_dir else None
+        seed = re.search(r"seed_(\d+)", output_dir or "")
+        CURRENT["seed"] = int(seed.group(1)) if seed else None
         self.trace = []
         self.lam3 = env("MOMENT_LAMBDA3", 1.0, float)
         self.dev = dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -166,12 +170,14 @@ class OracleMomentReward(Reward):
 
 
 if __name__ == "__main__":
+    # Use the objects of the importable module `moments.reward`, not this `__main__` copy: otherwise the module is
+    # loaded twice and state shared with other modules (NOISE, CURRENT) would live in two separate dictionaries.
     import embedopt.reward.map as _map
-
-    _map.MapReward = OracleMomentReward  # inference.py builds MapReward for reward type "map"
-    install_noise_hook()
+    import moments.reward as mr
     from moments.partial import install_partial_diffusion
 
+    _map.MapReward = mr.OracleMomentReward  # inference.py builds MapReward for reward type "map"
+    mr.install_noise_hook()
     install_partial_diffusion()  # no-op unless PARTIAL_INIT is set
     from embedopt.inference.inference import main
 
