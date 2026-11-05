@@ -11,9 +11,14 @@ set -euo pipefail
 SYS=8K9Z_A
 SEEDS=101,102,103,104,105
 
-make run SYSTEM=$SYS METHOD=map LR=0.5 SEEDS=101 SAVE_EMB=1 TAG=_save 2>&1 | tee out/$SYS/map_lr0.5_save.log
-EMB=out/$SYS/map_lr0.5_save/${SYS}_map_lr0.5_save/seed_101/opted_vectors/embeddings_step_99.pt
-test -f $EMB || { echo "embedding not found: $EMB"; ls -R out/$SYS/map_lr0.5_save | head -30; exit 1; }
+find_emb() { find out/$SYS/map_lr0.5_save -name embeddings_step_99.pt 2>/dev/null | head -1; }
+EMB=$(find_emb)
+if [ -z "$EMB" ]; then  # skip the map rerun if its embedding already exists
+    make run SYSTEM=$SYS METHOD=map LR=0.5 SEEDS=101 SAVE_EMB=1 TAG=_save 2>&1 | tee out/$SYS/map_lr0.5_save.log
+    EMB=$(find_emb)
+fi
+test -n "$EMB" || { echo "embedding not found under out/$SYS/map_lr0.5_save"; exit 1; }
+echo "Warm-start embedding: $EMB"
 
 make run SYSTEM=$SYS METHOD=moment ORDER=2 LR=0.0 SEEDS=$SEEDS WARM=$EMB TAG=_warm 2>&1 | tee out/$SYS/moment2_lr0.0_warm.log
 make run SYSTEM=$SYS METHOD=moment ORDER=2 LR=0.1 SEEDS=$SEEDS WARM=$EMB TAG=_warm 2>&1 | tee out/$SYS/moment2_lr0.1_warm.log
