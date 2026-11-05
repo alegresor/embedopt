@@ -4,6 +4,7 @@
 #   make run SYSTEM=8K9Z_A METHOD=moment ORDER=3 LR=0.1 [DW=1] [RES=4.0]
 #   make check SYSTEM=8K9Z_A                      # summary table + CSV + figure over all runs in out/$(SYSTEM)/
 #   make check SYSTEM=8K9Z_A FIG=check_dw RUNS="base map_lr0.5 moment3_lr0.1 moment3dw_lr0.1"   # subset figure
+#   INIT=<structure.cif> SIGMA0=<A> runs partial diffusion: start from INIT noised to SIGMA0, run the remaining steps;
 #   SAVE_EMB=1 saves the final optimized embedding; WARM=<embeddings_step_*.pt> starts from a saved embedding;
 #   TAG=_suffix is appended to the run name (e.g. TAG=_warm)
 #
@@ -26,6 +27,8 @@ RUNS       ?=
 TAG        ?=
 WARM       ?=
 SAVE_EMB   ?= 0
+INIT       ?=
+SIGMA0     ?= 4.0
 CFG        ?= $(BENCH)/stage3a_cfgs/$(SYSTEM)_benchmark.json
 MODEL      ?= protenix_base_default_v0.5.0
 CKPT_DIR   ?= $(HOME)/.cache/protenix/checkpoint
@@ -37,7 +40,8 @@ export LAYERNORM_TYPE := torch_layernorm
 RES_TAG    = $(if $(filter 5.0,$(RES)),,_res$(RES))
 RUN_NAME   = $(if $(filter base,$(METHOD)),base,$(if $(filter map,$(METHOD)),map_lr$(LR),moment$(ORDER)$(if $(filter 1,$(DW)),dw,)_lr$(LR)$(RES_TAG)))$(TAG)
 RUN_CFG    = $(BENCH)/stage3a_cfgs/$(SYSTEM)_$(RUN_NAME).json
-MOMENT_ENV = MOMENT_DW=$(DW) MOMENT_LB=$(LB) MOMENT_LAMBDA3=$(LAMBDA3) MOMENT_NKAPPA=$(NKAPPA)
+PARTIAL_ENV = $(if $(INIT),PARTIAL_INIT=$(abspath $(INIT)) PARTIAL_SIGMA=$(SIGMA0),)
+MOMENT_ENV = $(PARTIAL_ENV) MOMENT_DW=$(DW) MOMENT_LB=$(LB) MOMENT_LAMBDA3=$(LAMBDA3) MOMENT_NKAPPA=$(NKAPPA)
 ENTRY_base   = MOMENT_ORDER=2 MOMENT_DW=0 MOMENT_LB=$(LB) MOMENT_NKAPPA=$(NKAPPA) python -m moments.reward
 ENTRY_moment = MOMENT_ORDER=$(ORDER) $(MOMENT_ENV) python -m moments.reward
 ENTRY_map    = python -m embedopt.inference.inference
@@ -59,6 +63,7 @@ run:
 	p.update({'save_embeddings_every_n_steps': -1} if '$(SAVE_EMB)' == '1' else {}); \
 	json.dump([j], open('$(RUN_CFG)', 'w'), indent=2)"
 	$(if $(WARM),test -f $(WARM) || (echo 'missing WARM embedding: $(WARM)'; exit 1),true)
+	$(if $(INIT),test -f $(INIT) || (echo 'missing INIT structure: $(INIT)'; exit 1),true)
 	$(ENTRY_$(METHOD)) --input_json_path $(RUN_CFG) $(RUN_ARGS)
 
 check:

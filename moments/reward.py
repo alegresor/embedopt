@@ -170,6 +170,9 @@ if __name__ == "__main__":
 
     _map.MapReward = OracleMomentReward  # inference.py builds MapReward for reward type "map"
     install_noise_hook()
+    from moments.partial import install_partial_diffusion
+
+    install_partial_diffusion()  # no-op unless PARTIAL_INIT is set
     from embedopt.inference.inference import main
 
     main()
