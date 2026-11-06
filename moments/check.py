@@ -5,8 +5,11 @@ settings, no Debye-Waller weighting): CA RMSD to x* (and mirrored), 80%-core RMS
 after the core fit, Rg, max radius, second-order loss m12 and third-order loss m3.
 Figure: colors distinguish runs, line styles / markers distinguish methods (base, map, moment2, moment3; DW runs bold).
 Per-step traces (t, s_t, m12, m3, RMSD) come from moment_trace.json, written by moment runs.
+With --data (exact | image_checks .npz), every prediction is also scored by the image-space losses against those data
+(columns m12_img, m3_img), and the m12 panel of the figure is replaced by m3_img.
 
 Usage: python -m moments.check --ref <x*.pdb> --runs out/SYS/base out/SYS/moment3_lr0.1 ... --out fig.png --csv rows.csv
+       [--data exact|out/SYS/image_moments_N1000000.npz]
 """
 
 import argparse
@@ -29,6 +32,7 @@ SIGMAS = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
 DW_WIDTHS = [0.0, 2.0, 4.0, 8.0]  # posterior widths s for the basin test
 SUCCESS = {"rmsd<5": ("rmsd", 5.0), "core<2": ("core", 2.0)}
 STYLE = {"base": ("-", "x"), "map": ("-", "o"), "moment2": ("--", "s"), "moment3": (":", "^")}
+IMG = ("m12_img", "m3_img")
 
 
 def method(run):
@@ -67,7 +71,13 @@ def structure_metrics(ref, pred, frac=0.8, iters=20):
 
 @torch.no_grad()
 def losses(rew, x, s=0.0):
-    m12, m3 = rew.losses(torch.as_tensor(x, dtype=torch.float32, device=rew.dev), s)
+    m12, m3 = rew.losses(torch.as_tensor(x, dtype=torch.float32, device=rew.dev), s, space="invariant", third=True)
+    return m12.item(), m3.item()
+
+
+@torch.no_grad()
+def img_losses(rew, x):
+    m12, m3 = rew.losses(torch.as_tensor(x, dtype=torch.float32, device=rew.dev), space="image", third=True)
     return m12.item(), m3.item()
 
 
@@ -78,6 +88,7 @@ def run_checks():
     ap.add_argument("--resolution", type=float, default=5.0)
     ap.add_argument("--out", default="out/check.png")
     ap.add_argument("--csv", default="out/summary.csv")
+    ap.add_argument("--data", default=None, help="image-space scoring data: exact | image_checks .npz")
     a = ap.parse_args()
     ref = bio.load_structure(a.ref)
     runs = [r.rstrip("/") for r in a.runs if os.path.isdir(r)]
@@ -89,7 +100,9 @@ def run_checks():
     rng = np.random.default_rng(0)
 
     # Sensitivity and Debye-Waller basin test on x* + per-atom noise
-    rew_ref = OracleMomentReward(a.ref, ref, resolution=a.resolution, order=3, dw=False)
+    make_reward = lambda pred: OracleMomentReward(a.ref, pred, resolution=a.resolution, order=3, dw=False, space="invariant",
+                                         data=a.data)
+    rew_ref = make_reward(ref)
     noisy = [ref.coord + s * rng.standard_normal(ref.coord.shape) for s in SIGMAS]
     print("\nSensitivity (x* + per-atom noise), unweighted and with Debye-Waller width s:")
     for s in DW_WIDTHS:
@@ -99,6 +112,10 @@ def run_checks():
         if s == 0:
             sens = v
     print(f"  (columns: sigma = {SIGMAS} A)")
+    if a.data:
+        v = np.array([img_losses(rew_ref, x) for x in noisy])
+        print(f"  image space ({a.data})   m12: " + " ".join(f"{u:.1e}" for u in v[:, 0]) + "   m3: " + " ".join(f"{u:.1e}" for u in v[:, 1]))
+        sens_img = v
     ax[1, 0].set(title="basin test: m3(x* + noise) / m3(x* + 0.25 A), by DW width s", xlabel="per-atom noise sigma (A)")
 
     # Final predictions; one scoring reward for all (Protenix atom order is identical across runs and seeds)
@@ -107,7 +124,7 @@ def run_checks():
         for f in sorted(glob.glob(f"{run}/**/predictions/*.cif", recursive=True)):
             pred = bio.load_structure(f)
             if rew_pred is None or len(pred) != n_atom:
-                rew_pred, n_atom = OracleMomentReward(a.ref, pred, resolution=a.resolution, order=3, dw=False), len(pred)
+                rew_pred, n_atom = make_reward(pred), len(pred)
             sm = structure_metrics(ref, pred)
             if sm is None:
                 print(f"  skipping {f}: CA count mismatch")
@@ -115,7 +132,8 @@ def run_checks():
             m, dev = sm
             m12, m3 = losses(rew_pred, pred.coord)
             seed = next((p for p in f.split(os.sep) if p.startswith("seed_")), "?")
-            rows.append(dict(run=g, seed=seed, m12=m12, m3=m3, **m))
+            extra = dict(zip(IMG, img_losses(rew_pred, pred.coord))) if a.data else {}
+            rows.append(dict(run=g, seed=seed, m12=m12, m3=m3, **extra, **m))
             dev_all.setdefault(g, []).append(dev)
     df = pd.DataFrame(rows)
     for name, (col, thr) in SUCCESS.items():
@@ -127,12 +145,14 @@ def run_checks():
     order = [g for g in names if g in set(df.run)]
     print(f"\nx*: Rg {structure_metrics(ref, ref)[0]['rg']:.2f} A\n")
     fmt = lambda s: f"{s.median():6.2f} [{s.min():5.2f}, {s.max():5.2f}]"
-    print(f"{'run':<22}{'n':>3}  {'RMSD med [min,max]':<22}{'core med [min,max]':<22}{'within 2A':>10}{'Rg':>7}"
-          f"{'m12':>11}{'m3':>11}{'rmsd<5':>8}{'core<2':>8}")
+    w = max(22, max(len(g) for g in order) + 1)
+    print(f"{'run':<{w}}{'n':>3}  {'RMSD med [min,max]':<22}{'core med [min,max]':<22}{'within 2A':>10}{'Rg':>7}"
+          f"{'m12':>11}{'m3':>11}" + ("".join(f"{c:>11}" for c in IMG) if a.data else "") + f"{'rmsd<5':>8}{'core<2':>8}")
     for g in order:
         d = df[df.run == g]
-        print(f"{g:<22}{len(d):>3}  {fmt(d.rmsd):<22}{fmt(d.core):<22}{d.within2.median():>9.0%}{d.rg.median():>7.1f}"
-              f"{d.m12.median():>11.2e}{d.m3.median():>11.2e}{d['rmsd<5'].mean():>8.0%}{d['core<2'].mean():>8.0%}")
+        print(f"{g:<{w}}{len(d):>3}  {fmt(d.rmsd):<22}{fmt(d.core):<22}{d.within2.median():>9.0%}{d.rg.median():>7.1f}"
+              f"{d.m12.median():>11.2e}{d.m3.median():>11.2e}" + ("".join(f"{d[c].median():>11.2e}" for c in IMG) if a.data else "")
+              + f"{d['rmsd<5'].mean():>8.0%}{d['core<2'].mean():>8.0%}")
     print(f"\nRows written to {a.csv}")
 
     # Row 0: reward as optimized, accuracy distributions
@@ -156,14 +176,15 @@ def run_checks():
         d = df[df.run == g]
         mk = STYLE[method(g)][1]
         ax[1, 1].semilogy(ref.res_id[ref.atom_name == "CA"], np.median(dev_all[g], axis=0), label=g, **{**sty(g), "lw": 0.9})
-        ax[1, 2].loglog(d.m12, d.core, mk, color=color[g], ms=5, label=g)
+        ax[1, 2].loglog(d.m3_img if a.data else d.m12, d.core, mk, color=color[g], ms=5, label=g)
         ax[1, 3].loglog(d.m3, d.core, mk, color=color[g], ms=5, label=g)
-    for v, axi in zip(sens[:, 0], [ax[1, 2]] * len(SIGMAS)):
-        axi.axvline(v, color="0.85", lw=0.8, zorder=0)
+    for v in (sens_img[:, 1] if a.data else sens[:, 0]):
+        ax[1, 2].axvline(v, color="0.85", lw=0.8, zorder=0)
     for v in sens[:, 1]:
         ax[1, 3].axvline(v, color="0.85", lw=0.8, zorder=0)
     ax[1, 1].set(title="median per-residue CA deviation after core fit (A)", xlabel="res_id (x*)")
-    ax[1, 2].set(title="does m12 predict accuracy? (grey: x* + 0.25..8 A noise)", xlabel="m12", ylabel="80%-core RMSD (A)")
+    ax[1, 2].set(title=f"does {'image-space m3' if a.data else 'm12'} predict accuracy? (grey: x* + 0.25..8 A noise)",
+                 xlabel="m3_img" if a.data else "m12", ylabel="80%-core RMSD (A)")
     ax[1, 3].set(title="does m3 predict accuracy? (grey: x* + 0.25..8 A noise)", xlabel="m3", ylabel="80%-core RMSD (A)")
 
     # Row 2: per-step traces from moment runs (median over seeds)

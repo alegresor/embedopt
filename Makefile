@@ -8,9 +8,13 @@
 #   INIT may contain {seed} and wildcards (per-seed start, e.g. from a previous run's predictions);
 #   SAVE_EMB=1 saves the final optimized embedding; WARM=<embeddings_step_*.pt> starts from a saved embedding;
 #   TAG=_suffix is appended to the run name (e.g. TAG=_warm)
+#   SPACE=image compares in image space (a, c2, c3; moments.image_moments) against DATA=exact (moments of x*) or
+#   DATA=images (out/$(SYSTEM)/image_moments_N1000000.npz from `make imagechecks`) or DATA=<path.npz>;
+#   run names get _imgx (exact) or _imgd (image data) before _lr. CHECK_DATA=exact|images|<npz> adds image-space
+#   columns m12_img, m3_img to `make check`.
 #
 # METHOD=base   : unguided Protenix (second-order moment loss logged only)     -> out/$(SYSTEM)/base
-# METHOD=moment : EmbedOpt + oracle uniform-mu moments of order ORDER (2 or 3)  -> out/$(SYSTEM)/moment<ORDER>[dw]_lr<LR>[_res<RES>]
+# METHOD=moment : EmbedOpt + oracle uniform-mu moments of order ORDER (2 or 3)  -> out/$(SYSTEM)/moment<ORDER>[dw][_imgx|_imgd]_lr<LR>[_res<RES>]
 #                 DW=1 weights the moment losses by the denoiser's posterior positional uncertainty (Debye-Waller)
 # METHOD=map    : EmbedOpt + Li et al.'s MapReward on the 5 A synthetic map      -> out/$(SYSTEM)/map_lr<LR>
 #                 (moments.map_entry = their entry point + optional partial diffusion)
@@ -24,6 +28,12 @@ LB         ?= 24
 LAMBDA3    ?= 1.0
 NKAPPA     ?= 16
 DW         ?= 0
+SPACE      ?= invariant
+DATA       ?= exact
+CHECK_DATA ?=
+NB3        ?= 8
+Q3         ?= 16
+C3_CHUNK   ?= 256
 FIG        ?= check
 RUNS       ?=
 TAG        ?=
@@ -40,11 +50,14 @@ SEEDS      ?= 101,102,103,104,105
 export LAYERNORM_TYPE := torch_layernorm
 
 RES_TAG    = $(if $(filter 5.0,$(RES)),,_res$(RES))
-RUN_NAME   = $(if $(filter base,$(METHOD)),base,$(if $(filter map,$(METHOD)),map_lr$(LR),moment$(ORDER)$(if $(filter 1,$(DW)),dw,)_lr$(LR)$(RES_TAG)))$(TAG)
+SPACE_TAG  = $(if $(filter image,$(SPACE)),$(if $(filter exact,$(DATA)),_imgx,_imgd),)
+DATA_SRC   = $(if $(filter exact,$(1)),exact,$(abspath $(if $(filter images,$(1)),out/$(SYSTEM)/image_moments_N1000000.npz,$(1))))
+RUN_NAME   = $(if $(filter base,$(METHOD)),base,$(if $(filter map,$(METHOD)),map_lr$(LR),moment$(ORDER)$(if $(filter 1,$(DW)),dw,)$(SPACE_TAG)_lr$(LR)$(RES_TAG)))$(TAG)
 RUN_CFG    = $(BENCH)/stage3a_cfgs/$(SYSTEM)_$(RUN_NAME).json
 PARTIAL_ENV = $(if $(INIT),PARTIAL_INIT=$(abspath $(INIT)) PARTIAL_SIGMA=$(SIGMA0),)
-MOMENT_ENV = $(PARTIAL_ENV) MOMENT_DW=$(DW) MOMENT_LB=$(LB) MOMENT_LAMBDA3=$(LAMBDA3) MOMENT_NKAPPA=$(NKAPPA)
-ENTRY_base   = MOMENT_ORDER=2 MOMENT_DW=0 MOMENT_LB=$(LB) MOMENT_NKAPPA=$(NKAPPA) python -m moments.reward
+MOMENT_ENV = $(PARTIAL_ENV) MOMENT_DW=$(DW) MOMENT_LB=$(LB) MOMENT_LAMBDA3=$(LAMBDA3) MOMENT_NKAPPA=$(NKAPPA) \
+             MOMENT_SPACE=$(SPACE) MOMENT_DATA=$(call DATA_SRC,$(DATA)) MOMENT_NB3=$(NB3) MOMENT_Q3=$(Q3) MOMENT_C3_CHUNK=$(C3_CHUNK)
+ENTRY_base   = MOMENT_ORDER=2 MOMENT_DW=0 MOMENT_SPACE=invariant MOMENT_LB=$(LB) MOMENT_NKAPPA=$(NKAPPA) python -m moments.reward
 ENTRY_moment = MOMENT_ORDER=$(ORDER) $(MOMENT_ENV) python -m moments.reward
 ENTRY_map    = $(PARTIAL_ENV) python -m moments.map_entry
 
@@ -53,7 +66,11 @@ RUN_ARGS = --dump_dir out/$(SYSTEM)/$(RUN_NAME) --model_name $(MODEL) \
            --enable_diffusion_shared_vars_cache false \
            --sample_diffusion.N_step $(N_STEP) --seeds $(SEEDS)
 
-.PHONY: cfg maps run check imagechecks
+.PHONY: cfg maps run check imagechecks imagetest
+
+# Unit test of the image-space reward maps (no Protenix): port vs image_checks, floors, invariance, gradients, cost
+imagetest:
+	python -m moments.image_moments --systems $(IC_SYSTEMS) --nb3 $(NB3) --q3 $(Q3) --chunk $(C3_CHUNK) 2>&1 | tee out/image_moments_test.log
 
 run:
 	python -c "import json; j = json.load(open('$(CFG)'))[0]; j['name'] = '$(SYSTEM)_$(RUN_NAME)'; \
@@ -71,7 +88,8 @@ run:
 check:
 	python -m moments.check --ref $(BENCH)/pdb_clean/$(SYSTEM).pdb \
 	       --runs $(if $(RUNS),$(addprefix out/$(SYSTEM)/,$(RUNS)),$(sort $(wildcard out/$(SYSTEM)/base out/$(SYSTEM)/map_lr* out/$(SYSTEM)/moment*_lr*))) \
-	       --out out/$(SYSTEM)/$(FIG).png --csv out/$(SYSTEM)/$(if $(RUNS),$(FIG),summary).csv
+	       --out out/$(SYSTEM)/$(FIG).png --csv out/$(SYSTEM)/$(if $(RUNS),$(FIG),summary).csv \
+	       $(if $(CHECK_DATA),--data $(call DATA_SRC,$(CHECK_DATA)),)
 
 maps:
 	python $(BENCH)/04_generate_map.py
