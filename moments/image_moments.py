@@ -4,7 +4,9 @@ From the spherical-harmonic coefficients A_lm(kappa) of a structure (moments.inv
 in-plane Fourier coefficients I_q(kappa) are
     a(k)             = A_00(k) / sqrt(4 pi)                                     first moment (radial)
     c2_q(k1, k2)     = (1/4pi) sum_{l >= |q|} beta_lq C_l(k1, k2),   q = 0..L     beta_lq: Fourier coeffs of P_l(cos phi)
-    c3_q1q2(a, b, c) = E_g[ I_q1(a) I_q2(b) I_{-q1-q2}(c) ],   |q| <= Q3, lowest NB3 shells, full bandlimit LB there.
+    c3_q1q2(a, b, c) = E_g[ I_q1(a) I_q2(b) I_{-q1-q2}(c) ],   |q| <= Q3, on NB3 shells, full bandlimit LB there.
+The third-order shells are the lowest NB3 (S3STRIDE = 0, default) or every S3STRIDE-th shell, as in the invariant
+bispectrum (S3STRIDE = 2: shells 2, 4, ..., 16 of 16, out to the full resolution); LB is set by the outermost one.
 c3 is an exact quadrature over viewing directions g = Rz(alpha) Ry(beta) (Gauss-Legendre in cos beta x trapezoid in
 alpha, exact for the degree-3LB integrand); the in-plane rotation is already integrated by the selection rule
 q1 + q2 + q3 = 0. The node images are I_q(g) = sum_m e^{i m alpha} sum_l A_lm E^l_mq(beta), E^l_mq(beta) the in-plane
@@ -19,7 +21,7 @@ Data: "exact" = the moments of x* through these same maps (zero floor), or an .n
 Precision: tables are built in float64 and cast; evaluation in complex64 inside full_precision() (no TF32/autocast).
 c3 is accumulated over node chunks with gradient checkpointing (memory ~ one chunk).
 
-Self-test (no Protenix needed): python -m moments.image_moments --systems 8AHU_A 8K9Z_A 8H1I_A
+Self-test (no Protenix needed): python -m moments.image_moments --systems 8AHU_A 8K9Z_A 8H1I_A [--s3-stride 2 --q3 24]
 """
 
 import functools
@@ -42,10 +44,23 @@ def lm_index(L):
     return ls, ms
 
 
-def grid(kappa, r_max, nb3, l_pad=L_PAD):
-    """Bandlimits as in image_checks: L for all shells, LB for the lowest nb3 shells, and the in-plane grid size."""
+def third_shells(n_kappa, nb3, stride=0):
+    """Shell indices of the third order: the lowest nb3 (stride 0) or every stride-th shell (as Invariants.shells)."""
+    sh = np.arange(nb3) if stride == 0 else np.arange(stride - 1, n_kappa, stride)[:nb3]
+    if len(sh) < nb3 or sh[-1] >= n_kappa:
+        raise ValueError(f"cannot take {nb3} third-order shells with stride {stride} from {n_kappa} shells")
+    return sh
+
+
+def c3_tag(stride, Q3):
+    """Suffix for run names and data files when the third-order grid is not the default (lowest shells, |q| <= 16)."""
+    return "" if (stride == 0 and Q3 == 16) else f"_c3s{stride}q{Q3}"
+
+
+def grid(kappa, r_max, shells3, l_pad=L_PAD):
+    """Bandlimits as in image_checks: L for all shells, LB for the outermost third-order shell (<= L), in-plane grid."""
     L = int(np.ceil(2 * np.pi * kappa[-1] * r_max)) + l_pad
-    LB = int(np.ceil(2 * np.pi * kappa[nb3 - 1] * r_max)) + l_pad
+    LB = min(L, int(np.ceil(2 * np.pi * kappa[shells3[-1]] * r_max)) + l_pad)
     return L, LB, int(16 * np.ceil(2 * (L + 1) / 16))
 
 
@@ -61,7 +76,7 @@ def tables(L, LB, nphi, Q3):
     ls, ms = lm_index(LB)
     qq = np.arange(-2 * Q3, 2 * Q3 + 1)
     M = 2 * LB + 1
-    Ep = np.zeros((M, LB + 1, nb, len(qq)), complex)
+    Ep = np.zeros((M, LB + 1, nb, len(qq)), np.complex64)  # complex64: ~1.4 GB at LB = 83, |q| <= 24
     for k, b in enumerate(np.arccos(cb)):
         u = e @ np.array([[np.cos(b), 0, np.sin(b)], [0, 1, 0], [-np.sin(b), 0, np.cos(b)]]).T
         Y = sph_harm(ls[None], ms[None], np.arccos(np.clip(u[:, 2], -1, 1))[:, None], np.arctan2(u[:, 1], u[:, 0])[:, None])
@@ -78,27 +93,31 @@ def tables(L, LB, nphi, Q3):
 class ImageMoments:
     """Differentiable map A (N_kappa, >= (L+1)^2) -> dict(a, c2, c3) on the image_checks grid."""
 
-    def __init__(self, kappa, r_max, L=None, nb3=8, Q3=16, chunk=256, dev="cpu", dtype=torch.float32):
+    def __init__(self, kappa, r_max, L=None, nb3=8, Q3=16, stride3=0, chunk=256, dev="cpu", dtype=torch.float32):
         self.kappa = np.asarray(kappa, np.float64)
-        Lg, self.LB, self.nphi = grid(self.kappa, r_max, nb3)
+        self.shells3 = third_shells(len(self.kappa), nb3, stride3)
+        Lg, self.LB, self.nphi = grid(self.kappa, r_max, self.shells3)
         self.L = Lg if L is None else L
         if self.L != Lg:
             self.nphi = int(16 * np.ceil(2 * (self.L + 1) / 16))
-        self.nb3, self.Q3, self.chunk = nb3, Q3, chunk
+        self.LB = min(self.LB, self.L)
+        self.nb3, self.Q3, self.stride3, self.chunk = nb3, Q3, stride3, chunk
         self.cdt = torch.complex64 if dtype == torch.float32 else torch.complex128
         beta, Ep, idx, mask, phase, w = tables(self.L, self.LB, self.nphi, Q3)
         c = lambda a: torch.as_tensor(a, dtype=self.cdt, device=dev)
         self.beta, self.Ep, self.phase = c(beta), c(Ep).reshape(Ep.shape[0], Ep.shape[1], -1), c(phase)
         self.mask, self.w = c(mask), torch.as_tensor(w.copy(), dtype=dtype, device=dev)
         self.idx = torch.as_tensor(idx, device=dev)
+        self.sh3 = torch.as_tensor(self.shells3, device=dev)
         self.nb, self.na = Ep.shape[2], phase.shape[0]
         qs = np.arange(-Q3, Q3 + 1)
         self.i1 = torch.as_tensor(qs + 2 * Q3, device=dev)
         self.i3 = torch.as_tensor(-qs[:, None] - qs[None, :] + 2 * Q3, device=dev)
 
     def describe(self):
-        return (f"image space: L={self.L}, n_phi={self.nphi}, third order on the lowest {self.nb3} shells "
-                f"(to {1 / self.kappa[self.nb3 - 1]:.1f} A) with LB={self.LB}, |q|<={self.Q3}, "
+        which = f"the lowest {self.nb3} shells" if self.stride3 == 0 else f"{self.nb3} shells (every {self.stride3}th: {[int(v) for v in self.shells3 + 1]})"
+        return (f"image space: L={self.L}, n_phi={self.nphi}, third order on {which} "
+                f"(to {1 / self.kappa[self.shells3[-1]]:.1f} A) with LB={self.LB}, |q|<={self.Q3}, "
                 f"{self.nb * self.na} viewing directions ({self.nb} x {self.na}), chunk {self.chunk}")
 
     def moments(self, A, third=True):
@@ -112,7 +131,7 @@ class ImageMoments:
     def node_images(self, A):
         """In-plane coefficients at every viewing direction, lowest nb3 shells: (nodes, nb3, 4 Q3 + 1)."""
         with full_precision():
-            Ap = A[: self.nb3, self.idx] * self.mask                                # (a, m, l)
+            Ap = A[self.sh3[:, None, None], self.idx[None]] * self.mask             # (a, m, l)
             H = Ap.permute(1, 0, 2) @ self.Ep                                       # (m, a, nb * q)
             I = (self.phase @ H.reshape(H.shape[0], -1)).reshape(self.na, self.nb3, self.nb, -1)
             return I.permute(0, 2, 1, 3).reshape(self.na * self.nb, self.nb3, -1)
@@ -172,6 +191,9 @@ def load_data(src, im, A_ref):
     if not np.allclose(d["kappa"], im.kappa, rtol=1e-6):
         bad.append("kappa grid differs")
     bad += [f"{k}: {int(d[k])} vs {v}" for k, v in (("L", im.L), ("nb3", im.nb3), ("Q3", im.Q3)) if int(d[k]) != v]
+    sh = d["shells3"] if "shells3" in d else np.arange(int(d["nb3"]))  # files written before strides: lowest shells
+    if not np.array_equal(sh, im.shells3):
+        bad.append(f"third-order shells {[int(v) for v in sh]} vs {[int(v) for v in im.shells3]}")
     if bad:
         raise ValueError(f"image data {src} does not match the reward grid: " + "; ".join(bad))
     dev = im.beta.device
@@ -179,7 +201,7 @@ def load_data(src, im, A_ref):
 
 
 # ----------------------------------------------------------------------------------------------- self-test
-def _selftest(sys_, nb3, Q3, chunk, bench="examples/synthetic_map_benchmark"):
+def _selftest(sys_, nb3, Q3, chunk, stride3=0, bench="examples/synthetic_map_benchmark"):
     """Port (complex64) vs image_checks.Model (float64); floors vs the .npz; rotation / Kam checks; gradient check
     (complex128 directional derivative); timing and peak memory of one forward + backward."""
     import biotite.structure.io as bio
@@ -191,10 +213,11 @@ def _selftest(sys_, nb3, Q3, chunk, bench="examples/synthetic_map_benchmark"):
     ref = ref[ref.element != "H"]
     x = ref.coord.astype(np.float64)
     x -= x.mean(0)
-    _run_selftest(sys_, x, ref.element, form_factors, nb3, Q3, chunk, dev, f"out/{sys_}/image_moments_N1000000.npz")
+    _run_selftest(sys_, x, ref.element, form_factors, nb3, Q3, chunk, dev,
+                  f"out/{sys_}/image_moments_N1000000{c3_tag(stride3, Q3)}.npz", stride3=stride3)
 
 
-def _run_selftest(name, x, elements, form_factors, nb3, Q3, chunk, dev, npz=None, resolution=5.0, n_kappa=16):
+def _run_selftest(name, x, elements, form_factors, nb3, Q3, chunk, dev, npz=None, resolution=5.0, n_kappa=16, stride3=0):
     from scipy.spatial.transform import Rotation
 
     from moments import image_checks as ic
@@ -203,12 +226,13 @@ def _run_selftest(name, x, elements, form_factors, nb3, Q3, chunk, dev, npz=None
     kappa = np.arange(1, n_kappa + 1) / (n_kappa * resolution)
     r_max = 1.2 * np.linalg.norm(x, axis=1).max()
     rho = form_factors(elements, kappa, 50.0)
-    L, LB, nphi = grid(kappa, r_max, nb3)
+    shells3 = third_shells(n_kappa, nb3, stride3)
+    L, LB, nphi = grid(kappa, r_max, shells3)
     omega, WYc = ic.s2_quadrature64(L)
     coef = lambda y: ic.coefficients64(y, rho, kappa, omega, WYc)
     A = coef(x)
-    ref64 = ic.Model(L, LB, nphi, nb3, Q3).moments(A)[0]
-    im = ImageMoments(kappa, r_max, nb3=nb3, Q3=Q3, chunk=chunk, dev=dev)
+    ref64 = ic.Model(L, LB, nphi, nb3, Q3, shells3=shells3).moments(A)[0]
+    im = ImageMoments(kappa, r_max, nb3=nb3, Q3=Q3, stride3=stride3, chunk=chunk, dev=dev)
     print(f"\n=== {name}: {len(x)} atoms; {im.describe()}; device {dev}; setup {time.time() - t0:.0f}s")
     T = lambda a: torch.as_tensor(a, dtype=torch.complex64, device=dev)
     m32 = {k: v.cpu().numpy() for k, v in im.moments(T(A)).items()}
@@ -230,7 +254,7 @@ def _run_selftest(name, x, elements, form_factors, nb3, Q3, chunk, dev, npz=None
         print(f"  3. {lab:<13} m12 {m12:.2e}  m3 {m3:.2e}")
 
     # gradient check in complex128 at a perturbed point, random complex direction
-    im64 = ImageMoments(kappa, r_max, nb3=nb3, Q3=Q3, chunk=chunk, dev=dev, dtype=torch.float64)
+    im64 = ImageMoments(kappa, r_max, nb3=nb3, Q3=Q3, stride3=stride3, chunk=chunk, dev=dev, dtype=torch.float64)
     T64 = lambda a: torch.as_tensor(a, dtype=torch.complex128, device=dev)
     l64 = ImageLoss(im64.moments(T64(A)))
     rng = np.random.default_rng(1)
@@ -272,6 +296,7 @@ if __name__ == "__main__":
     ap.add_argument("--nb3", type=int, default=8)
     ap.add_argument("--q3", type=int, default=16)
     ap.add_argument("--chunk", type=int, default=256)
+    ap.add_argument("--s3-stride", type=int, default=0, help="0: lowest nb3 shells; k: every k-th shell")
     a = ap.parse_args()
     for s in a.systems:
-        _selftest(s, a.nb3, a.q3, a.chunk)
+        _selftest(s, a.nb3, a.q3, a.chunk, a.s3_stride)

@@ -1,4 +1,5 @@
 *.zip 
+*.tgz 
 out/
 out.old/ 
 cif_raw/

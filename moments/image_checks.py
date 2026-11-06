@@ -10,7 +10,9 @@ Model side, from the invariants A_lm(kappa) of a structure (exact, no sampling):
     a = A_00 / sqrt(4 pi),   c2_q = (1/4pi) sum_{l>=|q|} beta_lq C_l    (beta_lq: Fourier coefficients of P_l(cos phi)),
     c3 by exact quadrature over viewing directions, using E^l_mq(beta) = in-plane Fourier coefficients of Y_lm on the
        great circle Rz(alpha) Ry(beta) e(phi), and Y_lm(Rz(alpha) v) = e^{i m alpha} Y_lm(v).
-The bispectrum shells are the lowest NB3 shells, with the FULL bandlimit there (data coefficients include all degrees).
+The third-order shells are the lowest NB3 shells (--s3-stride 0) or every k-th shell (--s3-stride k, as the invariant
+bispectrum), with the FULL bandlimit there (data coefficients include all degrees). Non-default third-order grids get
+the suffix _c3s<k>q<Q3> on the output files (image_checks*.json / .png, image_moments_N*.npz).
 
 Checks (printed, and written to out/<SYS>/image_checks.json / .png):
   1. node machinery: image rendered from atoms at a quadrature node vs the E-route prediction (should be ~1e-7)
@@ -127,8 +129,9 @@ def coefficients64(x, rho, kappa, omega, WYc):
 class Model:
     """Exact image moments (a, c2, c3) from invariants A_lm (float64)."""
 
-    def __init__(self, L, LB, nphi, NB3, Q3):
+    def __init__(self, L, LB, nphi, NB3, Q3, shells3=None):
         self.L, self.LB, self.NB3, self.Q3 = L, LB, NB3, Q3
+        self.shells3 = np.arange(NB3) if shells3 is None else np.asarray(shells3)
         phi = 2 * np.pi * np.arange(nphi) / nphi
         self.e = np.stack([np.cos(phi), np.sin(phi), np.zeros(nphi)], 1)
         # beta[l, q], q = 0..L: P_l(cos phi) = sum_q beta_lq e^{i q phi}
@@ -148,15 +151,17 @@ class Model:
             E[k] = (np.fft.fft(Yc, axis=0) / nphi)[self.qq % nphi].T
         self.E = BK.array(E, BK.c128)
         mv = np.arange(-LB, LB + 1)
-        self.Sm = BK.array((ms[:, None] == mv[None, :]).astype(float), BK.c128)  # sum over l at fixed m
+        self.sel_m = [BK.idx(np.flatnonzero(ms == m)) for m in mv]                # lm indices at fixed m
         self.phase = BK.array(np.exp(1j * np.outer(self.alp, mv)), BK.c128)    # e^{i m alpha}
         qs = np.arange(-Q3, Q3 + 1)
         self.i1, self.i3 = BK.idx(qs + 2 * Q3), BK.idx(-qs[:, None] - qs[None, :] + 2 * Q3)
 
     def node_images(self, A):
         """In-plane coefficients I_q(kappa) at every quadrature node, for the bispectrum shells: (nodes, NB3, q)."""
-        Ab = BK.array(A[: self.NB3, : (self.LB + 1) ** 2], BK.c128)
-        H = BK.einsum("an,bnq,nm->bmaq", Ab, self.E, self.Sm)          # (nb, m, NB3, q)
+        Ab = BK.array(A[self.shells3, : (self.LB + 1) ** 2], BK.c128)
+        # H[b, m, a, q] = sum_{l >= |m|} A_lm(a) E^l_mq(b), one m at a time (no (nb, lm, q, m) intermediate)
+        H = BK.torch.stack if BK.torch else np.stack
+        H = H([BK.einsum("an,bnq->baq", Ab[:, sel], self.E[:, sel]) for sel in self.sel_m], 1)  # (nb, m, NB3, q)
         I = BK.einsum("bmaq,tm->btaq", H, self.phase)                   # (nb, na, NB3, q)
         return I.reshape(-1, self.NB3, len(self.qq))
 
@@ -185,7 +190,8 @@ def Rz(a):
 class Images:
     """Streams rendered images and accumulates (a, c2, c3) in float64; rendering in float32."""
 
-    def __init__(self, x, rho, kappa, nphi, L, NB3, Q3):
+    def __init__(self, x, rho, kappa, nphi, L, NB3, Q3, shells3=None):
+        self.shells3 = BK.idx(np.arange(NB3) if shells3 is None else np.asarray(shells3))
         self.x, self.rho = BK.array(x, BK.f32), BK.array(rho, BK.f32)
         self.kappa, self.nphi, self.L, self.NB3, self.Q3 = kappa, nphi, L, NB3, Q3
         phi = 2 * np.pi * np.arange(nphi) / nphi
@@ -208,7 +214,7 @@ class Images:
     def add(self, g):
         Iq = self.render(BK.array(g, BK.f32))
         s2 = BK.einsum("baq,bcq->qac", Iq[:, :, : self.L + 1], Iq[:, :, : self.L + 1].conj())
-        Ib = Iq[:, : self.NB3]
+        Ib = Iq[:, self.shells3]
         s3 = BK.einsum("baq,bdr,bcqr->qradc", Ib[:, :, self.i1], Ib[:, :, self.i1], Ib[:, :, self.i3])
         self.s1 += BK.cast(Iq[:, :, 0].sum(0), BK.c128)
         self.s2 += BK.cast(s2, BK.c128)
@@ -235,8 +241,10 @@ def rel(a, b):
 
 
 # ----------------------------------------------------------------------------------------------- main
-def check_system(sys_, nmax, batch, resolution, n_kappa, nb3, Q3, out):
+def check_system(sys_, nmax, batch, resolution, n_kappa, nb3, Q3, out, stride3=0):
     import biotite.structure.io as bio
+
+    from moments.image_moments import c3_tag, third_shells
 
     t0 = time.time()
     ref = bio.load_structure(f"{BENCH}/pdb_clean/{sys_}.pdb")
@@ -246,24 +254,26 @@ def check_system(sys_, nmax, batch, resolution, n_kappa, nb3, Q3, out):
     kappa = np.arange(1, n_kappa + 1) / (n_kappa * resolution)
     rmax = R_SAFETY * np.linalg.norm(x, axis=1).max()
     L = int(np.ceil(2 * np.pi * kappa[-1] * rmax)) + L_PAD
-    LB = int(np.ceil(2 * np.pi * kappa[nb3 - 1] * rmax)) + L_PAD
+    shells3 = third_shells(n_kappa, nb3, stride3)
+    tag = c3_tag(stride3, Q3)
+    LB = min(L, int(np.ceil(2 * np.pi * kappa[shells3[-1]] * rmax)) + L_PAD)
     nphi = int(16 * np.ceil(2 * (L + 1) / 16))
     rho = form_factors(ref.element, kappa, B_FACTOR)
     print(f"\n=== {sys_}: {len(x)} atoms, L={L}, n_phi={nphi}, {n_kappa} shells to {resolution} A; "
-          f"third order on the lowest {nb3} shells (to {1 / kappa[nb3 - 1]:.1f} A), LB={LB}, |q|<={Q3}; backend {BK.name}")
+          f"third order on shells {[int(v) for v in shells3 + 1]} (to {1 / kappa[shells3[-1]]:.1f} A), LB={LB}, |q|<={Q3}; backend {BK.name}")
 
     omega, WYc = s2_quadrature64(L)
     A = coefficients64(x, rho, kappa, omega, WYc)
-    model = Model(L, LB, nphi, nb3, Q3)
+    model = Model(L, LB, nphi, nb3, Q3, shells3=shells3)
     exact, C = model.moments(A)
     print(f"  invariants + model moments: {time.time() - t0:.0f}s")
-    res = dict(system=sys_, L=L, LB=LB, nphi=nphi, Q3=Q3, nb3=nb3)
+    res = dict(system=sys_, L=L, LB=LB, nphi=nphi, Q3=Q3, nb3=nb3, shells3=shells3.tolist())
 
     # 1. node machinery vs rendering at one quadrature node
-    imgs = Images(x, rho, kappa, nphi, L, nb3, Q3)
+    imgs = Images(x, rho, kappa, nphi, L, nb3, Q3, shells3=shells3)
     kb, ka = len(model.bet) // 3, model.na // 5
     g = Rz(model.alp[ka]) @ Ry(model.bet[kb])
-    Ir = BK.np(imgs.render(BK.array(g[None], BK.f32)))[0, :nb3][:, model.qq % nphi]
+    Ir = BK.np(imgs.render(BK.array(g[None], BK.f32)))[0, shells3][:, model.qq % nphi]
     In = BK.np(model.node_images(A)).reshape(len(model.bet), model.na, nb3, -1)[kb, ka]
     res["node_vs_render"] = float(np.abs(In - Ir).max() / np.abs(Ir).max())
     print(f"  1. node vs render (float32 rendering): {res['node_vs_render']:.1e}")
@@ -282,7 +292,8 @@ def check_system(sys_, nmax, batch, resolution, n_kappa, nb3, Q3, out):
         print(f"  2. N={n:>8}: rel err a {conv[-1]['a']:.2e}  c2 {conv[-1]['c2']:.2e}  c3 {conv[-1]['c3']:.2e}   "
               f"(N^-1/2 = {n**-0.5:.1e}; {time.time() - t1:.0f}s rendering so far)")
     res["convergence"] = conv
-    np.savez(f"{out}/image_moments_N{checkpoints[-1]}.npz", **data[checkpoints[-1]], kappa=kappa, nb3=nb3, Q3=Q3, L=L)
+    np.savez(f"{out}/image_moments_N{checkpoints[-1]}{tag}.npz", **data[checkpoints[-1]], kappa=kappa, nb3=nb3, Q3=Q3, L=L,
+             shells3=shells3)
 
     # 3. triangular inversion of c2 -> C_l (per degree)
     Bmat = model.beta.T / (4 * np.pi)  # c2_q = sum_l Bmat[q, l] C_l
@@ -321,9 +332,9 @@ def check_system(sys_, nmax, batch, resolution, n_kappa, nb3, Q3, out):
         print(f"     sigma = {s:4.2f} A                     {a:9.2e}  {b:9.2e}")
     print(f"     rotation of x*                      {res['rotation'][0]:9.2e}  {res['rotation'][1]:9.2e}")
     print(f"     Kam scramble                        {res['kam_scramble'][0]:9.2e}  {res['kam_scramble'][1]:9.2e}")
-    json.dump(res, open(f"{out}/image_checks.json", "w"), indent=1)
-    plot(res, f"{out}/image_checks.png")
-    print(f"  total {time.time() - t0:.0f}s; wrote {out}/image_checks.json, .png, image_moments_N{checkpoints[-1]}.npz")
+    json.dump(res, open(f"{out}/image_checks{tag}.json", "w"), indent=1)
+    plot(res, f"{out}/image_checks{tag}.png")
+    print(f"  total {time.time() - t0:.0f}s; wrote {out}/image_checks{tag}.json, .png, image_moments_N{checkpoints[-1]}{tag}.npz")
 
 
 def plot(res, path):
@@ -362,8 +373,9 @@ if __name__ == "__main__":
     ap.add_argument("--n-kappa", type=int, default=16)
     ap.add_argument("--nb3", type=int, default=8, help="lowest shells used for the third order")
     ap.add_argument("--q3", type=int, default=16)
+    ap.add_argument("--s3-stride", type=int, default=0, help="0: lowest nb3 shells; k: every k-th shell")
     a = ap.parse_args()
     for s in a.systems:
         out = f"out/{s}"
         os.makedirs(out, exist_ok=True)
-        check_system(s, a.nmax, a.batch, a.resolution, a.n_kappa, a.nb3, a.q3, out)
+        check_system(s, a.nmax, a.batch, a.resolution, a.n_kappa, a.nb3, a.q3, out, a.s3_stride)

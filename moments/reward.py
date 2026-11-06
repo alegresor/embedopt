@@ -24,7 +24,7 @@ Debye-Waller weighting is not available in image space.
 
 Configuration (environment variables, set by the Makefile): MOMENT_ORDER (2|3), MOMENT_DW (0|1), MOMENT_LB (bispectrum
 bandlimit), MOMENT_LAMBDA3, MOMENT_NKAPPA, MOMENT_SPACE (invariant|image), MOMENT_DATA (exact|<npz>), MOMENT_NB3,
-MOMENT_Q3, MOMENT_C3_CHUNK. The resolution comes from the reward params of the JSON config.
+MOMENT_Q3, MOMENT_S3STRIDE (0: lowest NB3 shells; k: every k-th shell), MOMENT_C3_CHUNK. The resolution comes from the reward params of the JSON config.
 Per-step traces (t, s_t, m12, m3 as optimized, CA RMSD, wall time per diffusion step, peak GPU memory) are written to <trajectory dir>/moment_trace.json.
 
 Usage: python -m moments.reward <embedopt.inference CLI>, with a config whose reward is
@@ -141,6 +141,7 @@ class OracleMomentReward(Reward):
                 n_kappa = len(self.inv.kappa)
                 self.img = ImageMoments(np.arange(1, n_kappa + 1) / (n_kappa * resolution), r_max, L=self.inv.L,
                                         nb3=env("MOMENT_NB3", 8, int), Q3=env("MOMENT_Q3", 16, int),
+                                        stride3=env("MOMENT_S3STRIDE", 0, int),
                                         chunk=env("MOMENT_C3_CHUNK", 256, int), dev=dev)
                 self.img_data = data
                 self.img_loss = ImageLoss(load_data(data, self.img, A_ref))
