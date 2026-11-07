@@ -24,7 +24,8 @@ Debye-Waller weighting is not available in image space.
 
 Configuration (environment variables, set by the Makefile): MOMENT_ORDER (2|3), MOMENT_DW (0|1), MOMENT_LB (bispectrum
 bandlimit), MOMENT_LAMBDA3, MOMENT_NKAPPA, MOMENT_SPACE (invariant|image), MOMENT_DATA (exact|<npz>), MOMENT_NB3,
-MOMENT_Q3, MOMENT_S3STRIDE (0: lowest NB3 shells; k: every k-th shell), MOMENT_C3_CHUNK. The resolution comes from the reward params of the JSON config.
+MOMENT_Q3, MOMENT_S3STRIDE (0: lowest NB3 shells; k: every k-th shell), MOMENT_C3_CHUNK, MOMENT_M12 (plain|white),
+MOMENT_M3 (block|perq|white|wblock), MOMENT_M12_DROP, MOMENT_M3_RCOND, MOMENT_M3B_RCOND (see moments.image_moments.ImageLoss). The resolution comes from the reward params of the JSON config.
 Per-step traces (t, s_t, m12, m3 as optimized, CA RMSD, wall time per diffusion step, peak GPU memory) are written to <trajectory dir>/moment_trace.json.
 
 Usage: python -m moments.reward <embedopt.inference CLI>, with a config whose reward is
@@ -86,7 +87,7 @@ def _suffix(dt, mem):
 
 class OracleMomentReward(Reward):
     def __init__(self, ref_pdb_path, pred_atom_array, resolution=5.0, agg="mean", device=None, order=None, dw=None,
-                 output_dir=None, space=None, data=None, **unused):
+                 output_dir=None, space=None, data=None, img_variants=False, **unused):
         super().__init__(name="OracleMoment", agg=agg)
         self.order = order or env("MOMENT_ORDER", 2, int)
         self.dw = bool(env("MOMENT_DW", 0, int)) if dw is None else dw
@@ -144,7 +145,17 @@ class OracleMomentReward(Reward):
                                         stride3=env("MOMENT_S3STRIDE", 0, int),
                                         chunk=env("MOMENT_C3_CHUNK", 256, int), dev=dev)
                 self.img_data = data
-                self.img_loss = ImageLoss(load_data(data, self.img, A_ref))
+                self.img_loss = ImageLoss(load_data(data, self.img, A_ref), self.img, m12=env("MOMENT_M12", "plain", str),
+                                          m3=env("MOMENT_M3", "block", str), drop=env("MOMENT_M12_DROP", 2, int),
+                                          rcond=env("MOMENT_M3_RCOND", 1e-6, float),
+                                          rcond_b=env("MOMENT_M3B_RCOND", 1e-9, float), all_variants=img_variants)
+                extra = ""
+                if hasattr(self.img_loss, "Ct"):  # per-degree error of the data's C_l (from c2) vs x*'s
+                    C0 = self.img.moments(A_ref, third=False)["C"][: self.img_loss.lw]
+                    e = ((C0 - self.img_loss.Ct).abs().pow(2).sum(dim=(1, 2)) / C0.abs().pow(2).sum(dim=(1, 2))).sqrt()
+                    extra = f"data C_l rel err: max {e.max():.1e} (l = {int(e.argmax())}), at l = {len(e) - 1}: {e[-1]:.1e}; "
+                logger.info(f"[OracleMoment] image losses: m12 {self.img_loss.mode12}, m3 {self.img_loss.mode3}; "
+                            f"{self.img_loss.info}{extra}")
                 chk_img = {"x* vs data": A_ref, **chk_img}
                 chk_img = ", ".join(f"{k} m12={a:.1e} m3={b:.1e}" for k, (a, b) in
                                     ((k, self.img_losses(A, True)) for k, A in chk_img.items()))
@@ -176,6 +187,12 @@ class OracleMomentReward(Reward):
         W = w[:, None, None] * w[None, :, None] * w[None, None, :]
         d = (W * (self.inv.bispectrum(A) - self.G_ref)).pow(2).sum(dim=(3, 4, 5))
         return (d[self.blocks] / self.G_ref_norm[self.blocks]).mean()
+
+    def img_variants(self, x):
+        """All image-space loss variants of a structure x (model atom order), as floats (needs img_variants=True)."""
+        x = x[self.keep]
+        A = self.inv.coefficients(x - x.mean(0), self.rho)
+        return {k: float(v) for k, v in self.img_loss.variants(self.img.moments(A, True)).items()}
 
     def img_losses(self, A, third=None):
         """Image-space (m12, m3 or None) of coefficients A against the image data."""

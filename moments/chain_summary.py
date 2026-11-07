@@ -3,7 +3,8 @@
 Environment: SYS (system), CSV (default out/$SYS/check_chain$TAG.csv), TAG (moment-run tag: "" = invariant space,
 "_imgx" / "_imgd" = image space with exact / image data), SELECT (selection column, default m3; m3_img for image runs),
 TAGS3 (space-separated tags of moment3 chains to show, all sharing pass 1 moment2$TAG; default $TAG; e.g.
-"_imgx _imgx_rep _imgx_c3s2q24"; the first is the reference for paired comparisons of the others).
+"_imgx _imgx_rep _imgx_c3s2q24"; the first is the reference for paired comparisons of the others), EXTRA
+(space-separated tags of further moment2 / moment3 chain pairs to show for comparison, e.g. "_imgx").
 
 Prints, for each chain, the median full / core RMSD, fraction within 2 A and success rates after each pass; paired
 per-seed comparisons of the final pass (moment3 vs moment2, moments vs map, final vs pass 1, and, for TAG != "", the
@@ -18,6 +19,7 @@ SYS, TAG = os.environ["SYS"], os.environ.get("TAG", "")
 CSV = os.environ.get("CSV", f"out/{SYS}/check_chain{TAG}.csv")
 SELECT = os.environ.get("SELECT", "m3")
 TAGS3 = os.environ.get("TAGS3", TAG).split() or [TAG]
+EXTRA = os.environ.get("EXTRA", "").split()
 T = ["", "_seq80", "_seq80_seq30", "_seq80_seq30_seq15"]
 
 
@@ -28,7 +30,8 @@ def chains(tag, tags3):
     return out
 
 
-CHAINS = {"map (map reward)": ["map_lr0.5" + t for t in T], **chains(TAG, TAGS3), **(chains("", [""]) if TAG else {})}
+CHAINS = {"map (map reward)": ["map_lr0.5" + t for t in T], **chains(TAG, TAGS3),
+          **{k: v for e in EXTRA for k, v in chains(e, [e]).items()}, **(chains("", [""]) if TAG else {})}
 
 d = pd.read_csv(CSV)
 core, full, within = (d.pivot_table(index="seed", columns="run", values=v) for v in ("core", "rmsd", "within2"))

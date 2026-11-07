@@ -6,7 +6,8 @@ after the core fit, Rg, max radius, second-order loss m12 and third-order loss m
 Figure: colors distinguish runs, line styles / markers distinguish methods (base, map, moment2, moment3; DW runs bold).
 Per-step traces (t, s_t, m12, m3, RMSD) come from moment_trace.json, written by moment runs.
 With --data (exact | image_checks .npz), every prediction is also scored by the image-space losses against those data
-(columns m12_img, m3_img), and the m12 panel of the figure is replaced by m3_img.
+(columns m12_img, m12w_img, m3_img, m3p_img, m3w_img, m3b_img: plain / white m12, block / perq / white / wblock m3), and the m12
+panel of the figure is replaced by m3_img.
 
 Usage: python -m moments.check --ref <x*.pdb> --runs out/SYS/base out/SYS/moment3_lr0.1 ... --out fig.png --csv rows.csv
        [--data exact|out/SYS/image_moments_N1000000.npz]
@@ -32,7 +33,7 @@ SIGMAS = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
 DW_WIDTHS = [0.0, 2.0, 4.0, 8.0]  # posterior widths s for the basin test
 SUCCESS = {"rmsd<5": ("rmsd", 5.0), "core<2": ("core", 2.0)}
 STYLE = {"base": ("-", "x"), "map": ("-", "o"), "moment2": ("--", "s"), "moment3": (":", "^")}
-IMG = ("m12_img", "m3_img")
+IMG = ("m12_img", "m12w_img", "m3_img", "m3p_img", "m3w_img", "m3b_img")  # image-space variants (moments.image_moments.ImageLoss)
 
 
 def method(run):
@@ -81,6 +82,11 @@ def img_losses(rew, x):
     return m12.item(), m3.item()
 
 
+@torch.no_grad()
+def img_variants(rew, x):
+    return rew.img_variants(torch.as_tensor(x, dtype=torch.float32, device=rew.dev))
+
+
 def run_checks():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ref", required=True)
@@ -101,7 +107,7 @@ def run_checks():
 
     # Sensitivity and Debye-Waller basin test on x* + per-atom noise
     make_reward = lambda pred: OracleMomentReward(a.ref, pred, resolution=a.resolution, order=3, dw=False, space="invariant",
-                                         data=a.data)
+                                         data=a.data, img_variants=bool(a.data))
     rew_ref = make_reward(ref)
     noisy = [ref.coord + s * rng.standard_normal(ref.coord.shape) for s in SIGMAS]
     print("\nSensitivity (x* + per-atom noise), unweighted and with Debye-Waller width s:")
@@ -132,7 +138,7 @@ def run_checks():
             m, dev = sm
             m12, m3 = losses(rew_pred, pred.coord)
             seed = next((p for p in f.split(os.sep) if p.startswith("seed_")), "?")
-            extra = dict(zip(IMG, img_losses(rew_pred, pred.coord))) if a.data else {}
+            extra = img_variants(rew_pred, pred.coord) if a.data else {}
             rows.append(dict(run=g, seed=seed, m12=m12, m3=m3, **extra, **m))
             dev_all.setdefault(g, []).append(dev)
     df = pd.DataFrame(rows)

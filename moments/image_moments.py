@@ -12,9 +12,22 @@ alpha, exact for the degree-3LB integrand); the in-plane rotation is already int
 q1 + q2 + q3 = 0. The node images are I_q(g) = sum_m e^{i m alpha} sum_l A_lm E^l_mq(beta), E^l_mq(beta) the in-plane
 Fourier coefficients of Y_lm on the great circle Ry(beta) e(phi).
 
-Losses (identical to image_checks.losses):
-    m12 = |a - a*|^2 / |a*|^2 + |c2 - c2*|^2 / |c2*|^2,
-    m3  = mean over (q1, q2) blocks of |c3 - c3*|^2 / |c3*|^2 (summed over the shell triple), nonzero blocks only.
+Losses. Default (identical to image_checks.losses):
+    m12 (plain) = |a - a*|^2 / |a*|^2 + |c2 - c2*|^2 / |c2*|^2,
+    m3 (block)  = mean over (q1, q2) blocks of |c3 - c3*|^2 / |c3*|^2 (summed over the shell triple), nonzero blocks only.
+Alternatives (MOMENT_M12, MOMENT_M3):
+    m12 white : the invariant m12 with the data's C_l recovered from c2 (c2_q = sum_l B_ql C_l, B = beta^T / 4pi upper
+                triangular): |a - a*|^2 / |a*|^2 + sum_{l <= L - drop} |C_l - C~_l|^2 / sum |C~_l|^2, C~ = B^-1 c2*.
+                The top `drop` degrees, where the inversion amplifies data error, are left out.
+    m3 perq   : sum_r w_r |c3_r - c3*_r|^2 / sum_r w_r |c3*_r|^2, w_r = 1 / (K K^T)_rr (moments.c3_metric).
+    m3 white  : |c3 - c3*|_W^2 / |c3*|_W^2 with W = (K K^T)^+: the error of the minimum-norm bispectrum estimate
+                K^+ c3, i.e. the bispectrum restricted to its part visible in images (moments.c3_metric).
+                Its norm is dominated by the large low-degree (second-order-like) triples, so it barely sees Kam's
+                ambiguity (Kam scramble ~1e-6); see wblock.
+    m3 wblock : as white, for the block-normalized bispectrum (each degree triple scaled to unit data norm, as in the
+                invariant m3): K' = K diag(s), s_l = |B^_l| over shell triples from the minimum-norm estimate of the
+                data, W' = (K' K'^T)^+. All from the data side (no oracle block norms). K' is much worse conditioned
+                than K; with rcond_b = 1e-6 the kept rank is too small to see Kam's ambiguity, hence rcond_b = 1e-9.
 Data: "exact" = the moments of x* through these same maps (zero floor), or an .npz written by image_checks
 (a, c2, c3, kappa, L, nb3, Q3), checked against this grid.
 
@@ -126,7 +139,7 @@ class ImageMoments:
             a = A[:, 0] / np.sqrt(4 * np.pi)
             C = torch.stack([A[:, l * l:(l + 1) ** 2] @ A[:, l * l:(l + 1) ** 2].conj().T for l in range(self.L + 1)])
             c2 = (self.beta.T @ C.reshape(self.L + 1, -1)).reshape(C.shape) / (4 * np.pi)
-            return dict(a=a, c2=c2, c3=self.c3(A) if third else None)
+            return dict(a=a, c2=c2, C=C, c3=self.c3(A) if third else None)
 
     def node_images(self, A):
         """In-plane coefficients at every viewing direction, lowest nb3 shells: (nodes, nb3, 4 Q3 + 1)."""
@@ -158,23 +171,89 @@ def _c3_chunk(I, w, i1, i3):
 
 
 class ImageLoss:
-    """m12 and block-normalized m3 against reference moments (dict a, c2, c3)."""
+    """m12 and m3 against reference moments (dict a, c2, c3). m12: plain | white; m3: block | perq | white."""
 
-    def __init__(self, ref):
-        self.ref = ref
+    M12, M3 = ("plain", "white"), ("block", "perq", "white", "wblock")
+
+    def __init__(self, ref, im=None, m12="plain", m3="block", drop=2, rcond=1e-6, rcond_b=1e-9, all_variants=False):
+        if m12 not in self.M12 or m3 not in self.M3:
+            raise ValueError(f"m12 must be one of {self.M12}, m3 one of {self.M3}; got {m12}, {m3}")
+        self.ref, self.mode12, self.mode3 = ref, m12, m3
         self.na, self.n2 = ref["a"].abs().pow(2).sum(), ref["c2"].abs().pow(2).sum()
         n = ref["c3"].abs().pow(2).sum(dim=(2, 3, 4))
         self.keep, self.n3 = n > 1e-12 * n.max(), n
+        self.info = ""
+        if m12 == "white" or all_variants:
+            # C~_l = B^-1 c2* per shell pair (float64), degrees l <= L - drop
+            L = ref["c2"].shape[0] - 1
+            Bm = im.beta.real.double().T.cpu().numpy() / (4 * np.pi)
+            c2 = ref["c2"].cpu().numpy().astype(np.complex128)
+            Ct = np.linalg.solve(Bm, c2.reshape(L + 1, -1)).reshape(c2.shape)
+            self.lw = L + 1 - drop
+            self.Ct = torch.as_tensor(Ct[: self.lw], dtype=ref["c2"].dtype, device=ref["c2"].device)
+            self.nC = self.Ct.abs().pow(2).sum()
+            self.info += f"m12 white: C_l from c2 by B^-1 (cond {np.linalg.cond(Bm):.0f}), l <= {self.lw - 1}; "
+        if m3 in ("perq", "white", "wblock") or all_variants:
+            from moments.c3_metric import block_metric, metric
 
-    def m12(self, m):
-        return (m["a"] - self.ref["a"]).abs().pow(2).sum() / self.na + (m["c2"] - self.ref["c2"]).abs().pow(2).sum() / self.n2
+            M = metric(im.LB, im.Q3, rcond=rcond)
+            dev = ref["c3"].device
+            self.w_r = torch.as_tensor(np.where(M["diag"] > 1e-14 * M["diag"].max(), 1 / np.maximum(M["diag"], 1e-300), 0.0),
+                                       dtype=torch.float64, device=dev)
+            self.Wh = torch.as_tensor(M["U"] / np.sqrt(M["lam"]), dtype=torch.float64, device=dev)  # (rows, rank)
+            self.nP = self._perq(ref["c3"])
+            self.nW = self._white(ref["c3"])
+            self.info += (f"m3 metric: {M['rows']} rows x {M['ncol']} degree triples, rank {M['rank']} "
+                          f"(rcond {rcond:g}, cond {M['cond']:.1e}); ")
+        if m3 == "wblock" or all_variants:
+            # metric of the block-normalized bispectrum: columns of K scaled by the data's (minimum-norm) block norms
+            c3r = self._rows(ref["c3"]).cpu().numpy()
+            Wb, nvis = block_metric(im.LB, im.Q3, c3r, M, rcond=rcond_b)
+            self.Wb = torch.as_tensor(Wb, dtype=torch.float64, device=ref["c3"].device)
+            self.nB = self._wblock(ref["c3"])
+            self.info += f"m3 wblock: {nvis} visible degree triples, rank {Wb.shape[1]} (rcond {rcond_b:g}); "
 
-    def m3(self, m):
-        d = (m["c3"] - self.ref["c3"]).abs().pow(2).sum(dim=(2, 3, 4))
-        return (d[self.keep] / self.n3[self.keep]).mean()
+    def _rows(self, c3):
+        Q = c3.shape[0]
+        return c3.reshape(Q * Q, -1).to(torch.complex128)                            # (rows, shell triples)
+
+    def _perq(self, c3):
+        return (self.w_r[:, None] * self._rows(c3).abs().pow(2)).sum()
+
+    def _white(self, c3):
+        with full_precision():
+            return (self.Wh.T.to(torch.complex128) @ self._rows(c3)).abs().pow(2).sum()
+
+    def _wblock(self, c3):
+        with full_precision():
+            return (self.Wb.T.to(torch.complex128) @ self._rows(c3)).abs().pow(2).sum()
+
+    def m12(self, m, mode=None):
+        mode = mode or self.mode12
+        e_a = (m["a"] - self.ref["a"]).abs().pow(2).sum() / self.na
+        if mode == "white":
+            return e_a + (m["C"][: self.lw] - self.Ct).abs().pow(2).sum() / self.nC
+        return e_a + (m["c2"] - self.ref["c2"]).abs().pow(2).sum() / self.n2
+
+    def m3(self, m, mode=None):
+        mode = mode or self.mode3
+        d = m["c3"] - self.ref["c3"]
+        if mode == "perq":
+            return (self._perq(d) / self.nP).to(m["c3"].real.dtype)
+        if mode == "white":
+            return (self._white(d) / self.nW).to(m["c3"].real.dtype)
+        if mode == "wblock":
+            return (self._wblock(d) / self.nB).to(m["c3"].real.dtype)
+        e = d.abs().pow(2).sum(dim=(2, 3, 4))
+        return (e[self.keep] / self.n3[self.keep]).mean()
 
     def __call__(self, m):
         return self.m12(m), (self.m3(m) if m["c3"] is not None else None)
+
+    def variants(self, m):
+        """All variants (needs all_variants=True): m12_img, m12w_img, m3_img (block), m3p_img, m3w_img, m3b_img."""
+        return dict(m12_img=self.m12(m, "plain"), m12w_img=self.m12(m, "white"), m3_img=self.m3(m, "block"),
+                    m3p_img=self.m3(m, "perq"), m3w_img=self.m3(m, "white"), m3b_img=self.m3(m, "wblock"))
 
 
 def load_data(src, im, A_ref):
@@ -249,27 +328,40 @@ def _run_selftest(name, x, elements, form_factors, nb3, Q3, chunk, dev, npz=None
     Asc = A.copy()
     ls, _ = lm_index(L)
     Asc[:, ls % 2 == 1] = Ar[:, ls % 2 == 1]
-    for lab, Ax in (("rotation", Ar), ("reflection", coef(-x)), ("Kam scramble", Asc), ("x* + 0.5 A", coef(x + 0.5 * np.random.default_rng(0).standard_normal(x.shape)))):
+    checks = (("rotation", Ar), ("reflection", coef(-x)), ("Kam scramble", Asc),
+              ("x* + 0.5 A", coef(x + 0.5 * np.random.default_rng(0).standard_normal(x.shape))))
+    for lab, Ax in checks:
         m12, m3 = loss(im.moments(T(Ax)))
         print(f"  3. {lab:<13} m12 {m12:.2e}  m3 {m3:.2e}")
+    t1 = time.time()
+    lossv = ImageLoss(im.moments(T(A)), im, all_variants=True)
+    C0 = im.moments(T(A), third=False)["C"][: lossv.lw]
+    eC = float(((C0 - lossv.Ct).abs().pow(2).sum() / C0.abs().pow(2).sum()).sqrt())
+    print(f"  6. loss variants ({lossv.info}setup {time.time() - t1:.0f}s); C_l recovered from exact c2: rel err {eC:.1e}")
+    print("     m12 plain / white,  m3 block / perq / white / wblock:")
+    for lab, Ax in checks:
+        v = {k: float(u) for k, u in lossv.variants(im.moments(T(Ax))).items()}
+        print(f"     {lab:<13} m12 {v['m12_img']:.2e} / {v['m12w_img']:.2e}   "
+              f"m3 {v['m3_img']:.2e} / {v['m3p_img']:.2e} / {v['m3w_img']:.2e} / {v['m3b_img']:.2e}")
 
     # gradient check in complex128 at a perturbed point, random complex direction
     im64 = ImageMoments(kappa, r_max, nb3=nb3, Q3=Q3, stride3=stride3, chunk=chunk, dev=dev, dtype=torch.float64)
     T64 = lambda a: torch.as_tensor(a, dtype=torch.complex128, device=dev)
-    l64 = ImageLoss(im64.moments(T64(A)))
+    l64 = ImageLoss(im64.moments(T64(A)), im64, all_variants=True)
     rng = np.random.default_rng(1)
     scale = np.abs(A).mean(axis=1, keepdims=True)
     A1 = T64(A + 0.02 * scale * (rng.standard_normal(A.shape) + 1j * rng.standard_normal(A.shape)))
     dA = T64(scale * (rng.standard_normal(A.shape) + 1j * rng.standard_normal(A.shape)))
-    for j, lab in enumerate(("m12", "m3")):
+    for lab, key in (("m12", "m12_img"), ("m3", "m3_img"), ("m12 white", "m12w_img"), ("m3 perq", "m3p_img"), ("m3 white", "m3w_img"),
+                     ("m3 wblock", "m3b_img")):
+        F = lambda Ax: l64.variants(im64.moments(Ax))[key]
         A1g = A1.clone().requires_grad_(True)
-        f = l64(im64.moments(A1g))[j]
-        (g,) = torch.autograd.grad(f, A1g)
+        (g,) = torch.autograd.grad(F(A1g), A1g)
         ad = (g.conj() * dA).real.sum().item()
         with torch.no_grad():
             eps = 1e-5
-            fd = (l64(im64.moments(A1 + eps * dA))[j] - l64(im64.moments(A1 - eps * dA))[j]).item() / (2 * eps)
-        print(f"  4. gradient check {lab}: autograd {ad:.6e}  finite diff {fd:.6e}  rel diff {abs(ad - fd) / abs(fd):.1e}")
+            fd = (F(A1 + eps * dA) - F(A1 - eps * dA)).item() / (2 * eps)
+        print(f"  4. gradient check {lab:<9}: autograd {ad:.6e}  finite diff {fd:.6e}  rel diff {abs(ad - fd) / abs(fd):.1e}")
 
     # timing / memory of the reward's image part (forward + backward), complex64
     Ag = T(A1.detach().cpu().numpy()).requires_grad_(True)
@@ -286,6 +378,24 @@ def _run_selftest(name, x, elements, form_factors, nb3, Q3, chunk, dev, npz=None
         dt = time.time() - t1
     mem = f", peak extra memory {(torch.cuda.max_memory_allocated() - base) / 2**30:.2f} GB" if dev == "cuda" else ""
     print(f"  5. forward + backward of m12 * m3 from A: {dt:.2f}s{mem}")
+
+    # analytic kernel c3 = K G (on A truncated to l <= Lv) vs the quadrature, and visibility of the bispectrum
+    from moments.c3_metric import bispectrum_quad, kernel, visible_fraction
+
+    t1 = time.time()
+    Lv = min(16, LB)
+    c3q = ic.Model(L, Lv, nphi, nb3, Q3, shells3=shells3).moments(A)[0]["c3"]
+    K, tr = kernel(Lv, Q3)
+    Gv = bispectrum_quad(A, shells3, Lv)
+    c3k = (K @ Gv[tr[:, 0], tr[:, 1], tr[:, 2]].reshape(len(tr), -1)).reshape(c3q.shape)
+    print(f"  7. analytic kernel K G vs quadrature c3 (l <= {Lv}): rel err {np.linalg.norm(c3k - c3q) / np.linalg.norm(c3q):.1e}"
+          f" ({time.time() - t1:.0f}s)")
+    if LB >= 24:
+        t1 = time.time()
+        vf = visible_fraction(bispectrum_quad(A, shells3, 24), 24, Q3)
+        print(f"  8. bispectrum l <= 24 on these shells visible in images at |q| <= {Q3}: raw {vf['raw']:.1%}, "
+              f"block-normalized {vf['block-normalized']:.1%}  (rank {vf['rank']} of {vf['rows']} rows, "
+              f"{vf['cols']} degree triples; {time.time() - t1:.0f}s)")
 
 
 if __name__ == "__main__":

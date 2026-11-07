@@ -16,6 +16,8 @@
 #   Q3 (|q| bound) this sets the third-order grid. Non-default grids add _c3s<k>q<Q3> to ORDER=3 image-space run names
 #   (VTAG; override e.g. VTAG=_rep for a replicate) and to the image data file. Also used by check / imagetest /
 #   imagechecks.
+#   M12=plain|white, M3=block|perq|white select the image-space loss variants (moments.image_moments.ImageLoss);
+#   non-default ones add _w12 / _m3<M3> to image-space run names (M12_DROP, M3_RCOND, M3B_RCOND: their parameters).
 #
 # METHOD=base   : unguided Protenix (second-order moment loss logged only)     -> out/$(SYSTEM)/base
 # METHOD=moment : EmbedOpt + oracle uniform-mu moments of order ORDER (2 or 3)  -> out/$(SYSTEM)/moment<ORDER>[dw][_imgx|_imgd]_lr<LR>[_res<RES>]
@@ -39,6 +41,11 @@ NB3        ?= 8
 Q3         ?= 16
 C3_CHUNK   ?= 256
 S3STRIDE   ?= 0
+M12        ?= plain
+M3         ?= block
+M12_DROP   ?= 2
+M3_RCOND   ?= 1e-6
+M3B_RCOND  ?= 1e-9
 FIG        ?= check
 RUNS       ?=
 TAG        ?=
@@ -57,14 +64,16 @@ export LAYERNORM_TYPE := torch_layernorm
 RES_TAG    = $(if $(filter 5.0,$(RES)),,_res$(RES))
 SPACE_TAG  = $(if $(filter image,$(SPACE)),$(if $(filter exact,$(DATA)),_imgx,_imgd),)
 C3_TAG     = $(if $(and $(filter 0,$(S3STRIDE)),$(filter 16,$(Q3))),,_c3s$(S3STRIDE)q$(Q3))
-VTAG      ?= $(if $(and $(filter 3,$(ORDER)),$(filter image,$(SPACE))),$(C3_TAG),)
+W_TAG      = $(if $(filter white,$(M12)),_w12,)$(if $(filter 3,$(ORDER)),$(if $(filter block,$(M3)),,_m3$(M3)),)
+VTAG      ?= $(if $(filter image,$(SPACE)),$(if $(filter 3,$(ORDER)),$(C3_TAG),)$(W_TAG),)
 DATA_SRC   = $(if $(filter exact,$(1)),exact,$(abspath $(if $(filter images,$(1)),out/$(SYSTEM)/image_moments_N1000000$(C3_TAG).npz,$(1))))
 RUN_NAME   = $(if $(filter base,$(METHOD)),base,$(if $(filter map,$(METHOD)),map_lr$(LR),moment$(ORDER)$(if $(filter 1,$(DW)),dw,)$(SPACE_TAG)$(VTAG)_lr$(LR)$(RES_TAG)))$(TAG)
 RUN_CFG    = $(BENCH)/stage3a_cfgs/$(SYSTEM)_$(RUN_NAME).json
 PARTIAL_ENV = $(if $(INIT),PARTIAL_INIT=$(abspath $(INIT)) PARTIAL_SIGMA=$(SIGMA0),)
 MOMENT_ENV = $(PARTIAL_ENV) MOMENT_DW=$(DW) MOMENT_LB=$(LB) MOMENT_LAMBDA3=$(LAMBDA3) MOMENT_NKAPPA=$(NKAPPA) \
              MOMENT_SPACE=$(SPACE) MOMENT_DATA=$(call DATA_SRC,$(DATA)) MOMENT_NB3=$(NB3) MOMENT_Q3=$(Q3) MOMENT_C3_CHUNK=$(C3_CHUNK) \
-             MOMENT_S3STRIDE=$(S3STRIDE)
+             MOMENT_S3STRIDE=$(S3STRIDE) MOMENT_M12=$(M12) MOMENT_M3=$(M3) MOMENT_M12_DROP=$(M12_DROP) \
+             MOMENT_M3_RCOND=$(M3_RCOND) MOMENT_M3B_RCOND=$(M3B_RCOND)
 ENTRY_base   = MOMENT_ORDER=2 MOMENT_DW=0 MOMENT_SPACE=invariant MOMENT_LB=$(LB) MOMENT_NKAPPA=$(NKAPPA) python -m moments.reward
 ENTRY_moment = MOMENT_ORDER=$(ORDER) $(MOMENT_ENV) python -m moments.reward
 ENTRY_map    = $(PARTIAL_ENV) python -m moments.map_entry
@@ -95,7 +104,7 @@ run:
 	$(ENTRY_$(METHOD)) --input_json_path $(RUN_CFG) $(RUN_ARGS)
 
 check:
-	MOMENT_NB3=$(NB3) MOMENT_Q3=$(Q3) MOMENT_S3STRIDE=$(S3STRIDE) MOMENT_C3_CHUNK=$(C3_CHUNK) \
+	MOMENT_NB3=$(NB3) MOMENT_Q3=$(Q3) MOMENT_S3STRIDE=$(S3STRIDE) MOMENT_C3_CHUNK=$(C3_CHUNK) MOMENT_M3_RCOND=$(M3_RCOND) MOMENT_M3B_RCOND=$(M3B_RCOND) \
 	python -m moments.check --ref $(BENCH)/pdb_clean/$(SYSTEM).pdb \
 	       --runs $(if $(RUNS),$(addprefix out/$(SYSTEM)/,$(RUNS)),$(sort $(wildcard out/$(SYSTEM)/base out/$(SYSTEM)/map_lr* out/$(SYSTEM)/moment*_lr*))) \
 	       --out out/$(SYSTEM)/$(FIG).png --csv out/$(SYSTEM)/$(if $(RUNS),$(FIG),summary).csv \
