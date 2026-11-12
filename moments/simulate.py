@@ -93,8 +93,12 @@ def make_sim(vol, p, n, defoci, seed, noise_var=None):
 
     L = vol.shape[0]
     fs = [RadialCTFFilter(voltage=300, defocus=float(d), Cs=2.7, alpha=0.1) for d in defoci]
-    kw = dict(L=L, n=n, vols=Volume(vol, pixel_size=p), unique_filters=fs, offsets=np.zeros((n, 2), np.float32),
-              amplitudes=np.ones(n, np.float32), seed=seed, pixel_size=p)
+    # Filter (defocus) assignment from an independent stream: ASPIRE draws it with the same seed as the rotations, which
+    # makes each defocus group cover a different slice of the first Euler angle (pose-defocus correlation). That is
+    # harmless for reconstruction but biases any CTF-weighted moment estimator.
+    fi = np.random.default_rng(seed + 7919).integers(0, len(fs), n) if fs else None
+    kw = dict(L=L, n=n, vols=Volume(vol, pixel_size=p), unique_filters=fs, filter_indices=fi,
+              offsets=np.zeros((n, 2), np.float32), amplitudes=np.ones(n, np.float32), seed=seed, pixel_size=p)
     if noise_var is not None and noise_var > 0:
         kw["noise_adder"] = WhiteNoiseAdder(var=float(noise_var), seed=seed + 1000)
     return Simulation(**kw)

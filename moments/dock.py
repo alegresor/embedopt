@@ -203,8 +203,11 @@ def fsc(v1, v2, p, nbins=None):
 
 
 def resolution_at(k, f, thr):
+    """Resolution (A) where the FSC first drops below thr; inf if already below at the first shell, Nyquist if never."""
     below = np.flatnonzero(f < thr)
-    return float(1 / k[below[0]]) if len(below) and below[0] > 0 else float(1 / k[-1])
+    if not len(below):
+        return float(1 / k[-1])
+    return float(1 / k[below[0]]) if below[0] > 0 else float("inf")
 
 
 def expected_threshold(vol, p, n_res, vol_factor=1.0, res=6.0):

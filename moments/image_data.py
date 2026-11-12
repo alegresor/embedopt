@@ -314,8 +314,23 @@ def noise_terms(G, meta, sim_dir):
     return Sig0, P0
 
 
+def pose_defocus_correlation(sim_dir):
+    """Largest normalized mean resultant of the first Euler angle within a defocus group of DIR/particles.star (about 1
+    for independent assignment; >> 1 when each group covers a slice of poses, as with ASPIRE's default assignment)."""
+    rows = read_star(f"{sim_dir}/particles.star")
+    rot = np.deg2rad([float(r["rlnAngleRot"]) for r in rows])
+    df = np.array([float(r["rlnDefocusU"]) for r in rows])
+    z = [np.abs(np.exp(1j * rot[df == d]).mean()) * np.sqrt((df == d).sum()) for d in np.unique(df)]
+    return float(max(z))
+
+
 def cmd_stack(a):
     meta, atoms, G, dev = setup(a.sim)
+    z = pose_defocus_correlation(a.sim)
+    if z > 5:
+        raise SystemExit(f"{a.sim}/particles.star: poses are correlated with defocus groups (statistic {z:.0f} >> 1; "
+                         "stack written before the fix in moments.simulate.make_sim). Its CTF-weighted moments would be "
+                         "biased: use `stream` instead, or regenerate the stack.")
     Sig0, P0 = noise_terms(G, meta, a.sim)
     acc = accumulate(G, stack_batches(a.sim, a.batch), meta["defoci"], dev)
     out = f"{a.sim}/moments_N{int(acc.n.sum())}.npz"
