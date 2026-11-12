@@ -8,6 +8,9 @@
 #   INIT may contain {seed} and wildcards (per-seed start, e.g. from a previous run's predictions);
 #   SAVE_EMB=1 saves the final optimized embedding; WARM=<embeddings_step_*.pt> starts from a saved embedding;
 #   TAG=_suffix is appended to the run name (e.g. TAG=_warm)
+#   METHOD=map MAP=<map.mrc> MAPREF=<model.pdb> MTAG=_x : map reward on another map (e.g. a RELION reconstruction), with
+#   MapReward's Kabsch frame taken from MAPREF (e.g. the prior docked into the map) instead of x*; run map_x_lr<LR>
+#   DTAG=_x names moment runs on other image data (DATA=<npz>): moment<ORDER>_imgd_x..._lr<LR>
 #   SPACE=image compares in image space (a, c2, c3; moments.image_moments) against DATA=exact (moments of x*) or
 #   DATA=images (out/$(SYSTEM)/image_moments_N1000000.npz from `make imagechecks`) or DATA=<path.npz>;
 #   run names get _imgx (exact) or _imgd (image data) before _lr. CHECK_DATA=exact|images|<npz> adds image-space
@@ -40,6 +43,10 @@ CHECK_DATA ?=
 NB3        ?= 8
 Q3         ?= 16
 C3_CHUNK   ?= 256
+MAP        ?=
+MAPREF     ?=
+MTAG       ?=
+DTAG       ?=
 S3STRIDE   ?= 0
 M12        ?= plain
 M3         ?= block
@@ -67,7 +74,7 @@ C3_TAG     = $(if $(and $(filter 0,$(S3STRIDE)),$(filter 16,$(Q3))),,_c3s$(S3STR
 W_TAG      = $(if $(filter white,$(M12)),_w12,)$(if $(filter 3,$(ORDER)),$(if $(filter block,$(M3)),,_m3$(M3)),)
 VTAG      ?= $(if $(filter image,$(SPACE)),$(if $(filter 3,$(ORDER)),$(C3_TAG),)$(W_TAG),)
 DATA_SRC   = $(if $(filter exact,$(1)),exact,$(abspath $(if $(filter images,$(1)),out/$(SYSTEM)/image_moments_N1000000$(C3_TAG).npz,$(1))))
-RUN_NAME   = $(if $(filter base,$(METHOD)),base,$(if $(filter map,$(METHOD)),map_lr$(LR),moment$(ORDER)$(if $(filter 1,$(DW)),dw,)$(SPACE_TAG)$(VTAG)_lr$(LR)$(RES_TAG)))$(TAG)
+RUN_NAME   = $(if $(filter base,$(METHOD)),base,$(if $(filter map,$(METHOD)),map$(MTAG)_lr$(LR),moment$(ORDER)$(if $(filter 1,$(DW)),dw,)$(SPACE_TAG)$(DTAG)$(VTAG)_lr$(LR)$(RES_TAG)))$(TAG)
 RUN_CFG    = $(BENCH)/stage3a_cfgs/$(SYSTEM)_$(RUN_NAME).json
 PARTIAL_ENV = $(if $(INIT),PARTIAL_INIT=$(abspath $(INIT)) PARTIAL_SIGMA=$(SIGMA0),)
 MOMENT_ENV = $(PARTIAL_ENV) MOMENT_DW=$(DW) MOMENT_LB=$(LB) MOMENT_LAMBDA3=$(LAMBDA3) MOMENT_NKAPPA=$(NKAPPA) \
@@ -95,6 +102,9 @@ run:
 	j['algorithm'] = {'type': 'base', 'params': {}} if '$(METHOD)' == 'base' else \
 	{'type': 'embedopt', 'params': {'reward_scale_s': $(LR), 'reward_scale_z': $(LR)}}; \
 	j['reward']['params']['resolution'] = 5.0 if '$(METHOD)' == 'map' else $(RES); \
+	rp = j['reward']['params']; \
+	rp.update({'ref_map_path': '$(abspath $(MAP))'} if '$(MAP)' and '$(METHOD)' == 'map' else {}); \
+	rp.update({'ref_pdb_path': '$(abspath $(MAPREF))'} if '$(MAPREF)' and '$(METHOD)' == 'map' else {}); \
 	p = j['algorithm']['params']; \
 	p.update({'override_embeddings_path': '$(abspath $(WARM))'} if '$(WARM)' else {}); \
 	p.update({'save_embeddings_every_n_steps': -1} if '$(SAVE_EMB)' == '1' else {}); \
