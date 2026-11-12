@@ -17,11 +17,11 @@ mkdir -p $SIM/relion/InitialModel $SIM/relion/Refine3D $SIM/relion/PostProcess
 cd $SIM
 
 if [ ! -f relion/recon_poses.mrc ]; then
-    relion_reconstruct --i particles.star --o relion/recon_poses.mrc --ctf --j $J 2>&1 | tee relion/recon_poses.log
+    relion_reconstruct --i particles_inv.star --o relion/recon_poses.mrc --ctf --j $J 2>&1 | tee relion/recon_poses.log
 fi
 
 if ! ls relion/InitialModel/run_it*_class001.mrc > /dev/null 2>&1; then
-    relion_refine --o relion/InitialModel/run --iter 200 --grad --denovo_3dref --i particles.star --ctf --K 1 --sym C1 \
+    relion_refine --o relion/InitialModel/run --iter 200 --grad --denovo_3dref --i particles_inv.star --ctf --K 1 --sym C1 \
         --flatten_solvent --zero_mask --dont_combine_weights_via_disc --pool 30 --pad 1 --particle_diameter $D \
         --oversampling 1 --healpix_order 1 --offset_range 6 --offset_step 2 --auto_sampling --tau2_fudge 4 \
         --j $J --gpu "$GPU" 2>&1 | tee relion/InitialModel/run.log
@@ -29,7 +29,7 @@ fi
 INI=$(ls relion/InitialModel/run_it*_class001.mrc | sort | tail -1)
 
 if [ ! -f relion/Refine3D/run_class001.mrc ]; then
-    mpirun -n $NP relion_refine_mpi --o relion/Refine3D/run --auto_refine --split_random_halves --i particles.star \
+    mpirun -n $NP relion_refine_mpi --o relion/Refine3D/run --auto_refine --split_random_halves --i particles_inv.star \
         --ref $INI --ini_high 30 --dont_combine_weights_via_disc --pool 30 --pad 2 --ctf --particle_diameter $D \
         --flatten_solvent --zero_mask --oversampling 1 --healpix_order 2 --auto_local_healpix_order 4 \
         --offset_range 5 --offset_step 2 --sym C1 --low_resol_join_halves 40 --norm --scale \
