@@ -64,8 +64,8 @@ PRIOR=$(ls out/$SYS/base/*/seed_101/predictions/*_sample_0.cif | head -1)
     --out $SIM/dock_full 2>&1 | tee $SIM/dock_full.log
 
 # 5. chains
-chain map_relpose_lr0.5 METHOD=map LR=0.5 MAP=$SIM/dock_poses/map.mrc MAPREF=$SIM/dock_poses/docked.pdb MTAG=_relpose
-chain map_relfull_lr0.5 METHOD=map LR=0.5 MAP=$SIM/dock_full/map.mrc MAPREF=$SIM/dock_full/docked.pdb MTAG=_relfull
+chain map_relpose_lr0.5 METHOD=map LR=0.5 MAP=$SIM/dock_poses/map_crop.mrc MAPREF=$SIM/dock_poses/docked.pdb MTAG=_relpose
+chain map_relfull_lr0.5 METHOD=map LR=0.5 MAP=$SIM/dock_full/map_crop.mrc MAPREF=$SIM/dock_full/docked.pdb MTAG=_relfull
 for NN in $N ${NSTREAM}_stream; do
     DT=_${TAG}n$(python -c "n=int('$NN'.split('_')[0]); print('1e%d' % len(str(n)[1:]))")
     D=$SIM/moments_N$NN.npz

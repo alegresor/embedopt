@@ -186,6 +186,29 @@ def clean_map(vol, p, n_res, vol_factor=2.0, res=6.0):
     return out, float(t), nvox
 
 
+def crop_around(vol, p, coords, pad=12.0):
+    """Cube around the atoms (map frame: voxel i at i * p A): returns (sub-volume (z, y, x), origin (x, y, z) in A).
+    Side = 2 (max radius about the centroid + pad), even number of voxels, clipped to the box. MapReward / SFC_Torch
+    put one structure-factor array of size atoms x reflections on the GPU, which scales with the cell volume: the full
+    288 A box needs ~5 GB, a ~130 A crop ~0.5 GB."""
+    L = vol.shape[0]
+    c = coords.mean(0)
+    half = int(np.ceil((np.linalg.norm(coords - c, axis=1).max() + pad) / p))
+    lo = np.clip(np.round(c / p).astype(int) - half, 0, L)                     # (x, y, z) voxel start
+    hi = np.clip(lo + 2 * half, 0, L)
+    sub = vol[lo[2]:hi[2], lo[1]:hi[1], lo[0]:hi[0]]
+    return np.ascontiguousarray(sub), lo * p
+
+
+def write_mrc_origin(path, vol, p, origin):
+    import mrcfile
+
+    with mrcfile.new(path, overwrite=True) as m:
+        m.set_data(np.ascontiguousarray(vol, np.float32))
+        m.voxel_size = p
+        m.header.origin = tuple(float(v) for v in origin)
+
+
 def fsc(v1, v2, p, nbins=None):
     """Fourier shell correlation of two maps on the same grid; returns (shell centres in 1/A, FSC)."""
     L = v1.shape[0]
@@ -235,11 +258,22 @@ def main():
     f.add_argument("--map", required=True)
     f.add_argument("--ref", required=True)
     f.add_argument("--out", default=None, help="json file")
+    c = sub.add_parser("crop", help="crop DIR/map.mrc around DIR/docked.pdb -> DIR/map_crop.mrc (origin kept)")
+    c.add_argument("--dir", required=True)
+    c.add_argument("--pad", type=float, default=12.0)
     t = sub.add_parser("threshold", help="density threshold enclosing the expected particle volume")
     t.add_argument("--map", required=True)
     t.add_argument("--nres", type=int, required=True)
     t.add_argument("--factor", type=float, default=1.0)
     a = ap.parse_args()
+    if a.cmd == "crop":
+        vol, p = read_map(f"{a.dir}/map.mrc")
+        X = bio.load_structure(f"{a.dir}/docked.pdb").coord.astype(np.float64)
+        sub, org = crop_around(vol, p, X, a.pad)
+        write_mrc_origin(f"{a.dir}/map_crop.mrc", sub, p, org)
+        print(f"{a.dir}/map_crop.mrc: {sub.shape[::-1]} voxels (x, y, z), origin {np.round(org, 2).tolist()} A "
+              f"({sub.shape[0] * p:.0f} A box)")
+        return
     if a.cmd == "threshold":
         vol, p = read_map(a.map)
         print(f"{expected_threshold(vol, p, a.nres, a.factor):.6g}")
@@ -272,6 +306,9 @@ def main():
         mv, thr, nvox = clean_map(mv, p, n_res)
         info.update(clean_threshold=thr, clean_voxels=nvox)
     write_mrc(f"{a.out}/map.mrc", mv, p)
+    sub, org = crop_around(mv, p, X)
+    write_mrc_origin(f"{a.out}/map_crop.mrc", sub, p, org)
+    info.update(crop_shape=list(sub.shape), crop_origin=org.tolist())
     if a.truth:
         tr = bio.load_structure(a.truth)
         tr = tr[tr.element != "H"]
