@@ -261,8 +261,16 @@ def load_data(src, im, A_ref):
     if src == "exact":
         with torch.no_grad():
             return im.moments(A_ref, third=True)
-    if not os.path.isfile(src):
-        raise FileNotFoundError(f"MOMENT_DATA={src} not found (make imagechecks writes out/<SYS>/image_moments_N*.npz)")
+    t0 = time.time()
+    while not os.path.isfile(src):  # data may still be being written by another job: wait (up to 12 h)
+        if time.time() - t0 > 12 * 3600:
+            raise FileNotFoundError(f"MOMENT_DATA={src} not found after waiting 12 h")
+        print(f"[load_data] waiting for {src} ({(time.time() - t0) / 60:.0f} min)", flush=True)
+        time.sleep(300)
+    size = -1
+    while os.path.getsize(src) != size:  # wait until the file has stopped growing
+        size = os.path.getsize(src)
+        time.sleep(30)
     d = np.load(src)
     S, Q = im.nb3, 2 * im.Q3 + 1
     want = dict(a=(len(im.kappa),), c2=(im.L + 1, len(im.kappa), len(im.kappa)), c3=(Q, Q, S, S, S))
