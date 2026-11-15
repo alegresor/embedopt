@@ -34,7 +34,7 @@ PY
 fi
 mkdir -p $SIM/relion/InitialModel $SIM/relion/Refine3D $SIM/relion/PostProcess
 cd $SIM
-latest() { ls $1 2>/dev/null | sort | tail -1; }
+latest() { ls $1 2>/dev/null | sort | tail -1 || true; }
 
 if [ ! -f relion/recon_poses.mrc ]; then
     relion_reconstruct --i particles_inv.star --o relion/recon_poses.mrc --ctf 2>&1 | tee relion/recon_poses.log
