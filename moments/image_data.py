@@ -60,16 +60,21 @@ class PolarGrid:
         kx = (self.kappa[:, None] * np.cos(phi)[None]).ravel()
         ky = (self.kappa[:, None] * np.sin(phi)[None]).ravel()
         self.xn, self.yn = 2 * np.pi * ky * p, 2 * np.pi * kx * p  # finufft: first coordinate <-> first axis (y)
+        self.kx, self.ky = kx.reshape(NKAPPA, -1), ky.reshape(NKAPPA, -1)
         if 2 * np.pi * self.kappa[-1] * p > np.pi:
             raise ValueError("shells beyond the image Nyquist frequency")
 
-    def coeffs(self, imgs):
-        """imgs (B, L, L) [y, x] -> in-plane coefficients I_q(kappa), (B, NKAPPA, n_phi) complex128 (q in fft order)."""
+    def coeffs(self, imgs, shifts=None):
+        """imgs (B, L, L) [y, x] -> in-plane coefficients I_q(kappa), (B, NKAPPA, n_phi) complex128 (q in fft order).
+        shifts (B, 2) in A, (x, y) as ASPIRE's offsets: recentre each image by the phase exp(-2 pi i xi . t)."""
         import finufft
 
         f = np.ascontiguousarray(imgs, dtype=np.complex128)
         v = finufft.nufft2d2(self.xn, self.yn, f, isign=-1, eps=1e-9, modeord=0)
         v = self.s * v.reshape(len(imgs), NKAPPA, self.nphi)
+        if shifts is not None:
+            t = np.asarray(shifts, float)
+            v = v * np.exp(-2j * np.pi * (self.kx[None] * t[:, 0, None, None] + self.ky[None] * t[:, 1, None, None]))
         return np.fft.fft(v, axis=-1) / self.nphi
 
 
@@ -233,10 +238,11 @@ def stream_batches(sim_dir, n, seed, batch=1024, clean=False, ctf=True, shift=0.
     defoci = meta["defoci"] if ctf else []
     nv = None if clean else meta["noise_var"]
     sim = make_sim(vol, meta["pixel"], n, defoci, seed, nv, shift) if ctf else make_sim_noctf(vol, meta["pixel"], n, seed, nv)
+    off = np.asarray(sim.offsets, float) * meta["pixel"]                  # A, (x, y)
     for i in range(0, n, batch):
         imgs = (sim.clean_images if clean else sim.images)[i:i + batch].asnumpy().astype(np.float64)
         d = np.asarray(defoci)[sim.filter_indices[i:i + batch]] if ctf else np.zeros(len(imgs))
-        yield imgs, d
+        yield imgs, d, off[i:i + batch]
 
 
 def make_sim_noctf(vol, p, n, seed, noise_var=None):
@@ -251,21 +257,26 @@ def make_sim_noctf(vol, p, n, seed, noise_var=None):
     return Simulation(**kw)
 
 
-def accumulate(G, batches, defoci, dev, log_every=100000, noise_est=None):
+def accumulate(G, batches, defoci, dev, log_every=100000, noise_est=None, recenter=None, seed=0):
     """noise_est: list to which per-batch estimates of the pixel noise variance are appended (from the image corners,
     outside the inscribed circle of the box, where for these boxes only noise remains), or None."""
     defoci = np.asarray(defoci) if len(defoci) else np.zeros(1)
     acc = Accumulator(G, len(defoci), dev)
     t0, seen = time.time(), 0
     corner = None
-    for imgs, d in batches:
+    rng = np.random.default_rng(seed + 4242)
+    for b in batches:
+        imgs, d = b[0], b[1]
+        sh = None
+        if recenter is not None:  # recentre with the true shifts plus N(0, recenter^2) estimation error per axis
+            sh = b[2] + recenter * rng.standard_normal(b[2].shape)
         if noise_est is not None:
             if corner is None:
                 n = np.arange(imgs.shape[-1]) - imgs.shape[-1] / 2
                 corner = (n[:, None] ** 2 + n[None, :] ** 2) > (imgs.shape[-1] / 2) ** 2
             noise_est.append(float(imgs[:, corner].var(axis=1).mean()))
         grp = np.abs(d[:, None] - defoci[None]).argmin(1)
-        acc.add(G.coeffs(imgs), grp)
+        acc.add(G.coeffs(imgs, sh), grp)
         seen += len(imgs)
         if seen % log_every < len(imgs):
             print(f"    {seen} images ({time.time() - t0:.0f}s)", flush=True)
@@ -286,6 +297,23 @@ def model_moments(G, atoms, dev, coords=None):
     im = ImageMoments(G.kappa, G.r_max, L=G.L, nb3=G.nb3, Q3=G.Q3, dev=dev, dtype=torch.float64)
     m = im.moments(torch.as_tensor(A, dtype=torch.complex128, device=dev))
     return {k: v for k, v in m.items() if v is not None}, im, A
+
+
+def coef_of(G, atoms):
+    from moments import image_checks as ic
+    from moments.invariants import form_factors
+
+    x = atoms.coord.astype(np.float64)
+    x = x - x.mean(0)
+    omega, WYc = ic.s2_quadrature64(G.L)
+    return ic.coefficients64(x, form_factors(atoms.element, G.kappa, 50.0), G.kappa, omega, WYc)
+
+
+def model_moments_wide(G, atoms, dev, extra):
+    """(ImageMoments with Q3 + extra, ImageMoments of the data grid), float64, for the shift envelope."""
+    wide = ImageMoments(G.kappa, G.r_max, L=G.L, nb3=G.nb3, Q3=G.Q3 + extra, dev=dev, dtype=torch.float64)
+    ims = ImageMoments(G.kappa, G.r_max, L=G.L, nb3=G.nb3, Q3=G.Q3, dev=dev, dtype=torch.float64)
+    return wide, ims
 
 
 def rel(a, b):
@@ -351,16 +379,20 @@ def cmd_stream(a):
     --defocus-error S : the estimator uses defocus values perturbed by N(0, S^2) A per defocus group (as a per-
                         micrograph CTF estimate would be), instead of the true ones;
     --noise-est       : the noise variance is estimated from the image corners instead of the true value;
-    --shift S         : the images have Gaussian in-plane shifts of standard deviation S A (not corrected)."""
+    --shift S         : the images have Gaussian in-plane shifts of standard deviation S A;
+    --recenter R      : ... recentred with the true shifts plus N(0, R^2) A error per axis (R = 0: exactly);
+    --clean           : noiseless images (for tests)."""
     meta, atoms, G, dev = setup(a.sim)
     Sig0, P0 = noise_terms(G, meta, a.sim)
     est = [] if a.noise_est else None
-    acc = accumulate(G, stream_batches(a.sim, a.n, a.seed, a.batch, shift=a.shift), meta["defoci"], dev, noise_est=est)
+    rc = a.recenter if a.recenter >= 0 else None
+    acc = accumulate(G, stream_batches(a.sim, a.n, a.seed, a.batch, clean=a.clean, shift=a.shift), meta["defoci"], dev,
+                     noise_est=est, recenter=rc, seed=a.seed)
     defoci = np.asarray(meta["defoci"], float)
     if a.defocus_error > 0:
         defoci = defoci + np.random.default_rng(a.seed + 31337).standard_normal(len(defoci)) * a.defocus_error
         print(f"  estimator defocus values (true + error): {np.round(defoci).tolist()}")
-    sigma2 = float(np.mean(est)) if est is not None else meta["noise_var"]
+    sigma2 = float(np.mean(est)) if est is not None else (0.0 if a.clean else meta["noise_var"])
     if est is not None:
         print(f"  noise variance estimated from the corners: {sigma2:.4e} (true {meta['noise_var']:.4e}, "
               f"ratio {sigma2 / meta['noise_var']:.4f})")
@@ -374,8 +406,30 @@ def cmd_floors(a):
     meta, atoms, G, dev = setup(a.sim)
     exact, im, _ = model_moments(G, atoms, dev)
     ex = {k: v.cpu().numpy() for k, v in exact.items()}
+    env = None
+    if a.shift_sigma:
+        from moments.shift_env import ShiftEnvelope
+        wide, ims = model_moments_wide(G, atoms, dev, 12)
+        env = ShiftEnvelope(ims, wide)
+        A = coef_of(G, atoms)
+        A = torch.as_tensor(A, dtype=torch.complex128, device=dev)
     for f in a.files:
         d = dict(np.load(f))
+        if env is not None:
+            from moments.image_moments import ImageLoss
+            T = lambda dd: {k: torch.as_tensor(np.asarray(v), dtype=torch.complex128, device=dev) for k, v in dd.items()
+                            if k in ("a", "c2", "c3")}
+            lo = ImageLoss(T(d), ims, all_variants=True)
+            m0 = ims.moments(A, third=False)
+            if a.shift_sigma == "fit":
+                s = env.fit_sigma(m0["a"], m0["c2"], lambda a_, c2_, C_: lo.m12(dict(a=a_, c2=c2_, C=C_), "white"))
+            else:
+                s = float(a.shift_sigma)
+            a2, c22, C2 = env.apply12(m0["a"], m0["c2"], s)
+            v = lo.variants(dict(a=a2, c2=c22, C=C2, c3=env.apply3(wide.c3(A), s)))
+            print(f"{os.path.basename(f):<44} with the shift envelope, sigma {s:.3f} A: x* vs data: "
+                  f"m12w {float(v['m12w_img']):.1e} m3wblock {float(v['m3b_img']):.1e}", flush=True)
+            continue
         lv = losses_vs(d, im, ex)
         e = {k: rel(d[k], ex[k]) for k in ("a", "c2", "c3")}
         print(f"{os.path.basename(f):<44} rel err a {e['a']:.1e} c2 {e['c2']:.1e} c3 {e['c3']:.1e}; x* vs data: "
@@ -445,6 +499,9 @@ def main():
     ap.add_argument("--noise-est", action="store_true", help="stream: estimate the noise variance from the corners")
     ap.add_argument("--shift", type=float, default=0.0, help="stream: in-plane shift std (A), uncorrected")
     ap.add_argument("--suffix", default="", help="stream: output name suffix")
+    ap.add_argument("--recenter", type=float, default=-1.0, help="stream: recentre with residual error R A (R >= 0)")
+    ap.add_argument("--clean", action="store_true", help="stream: noiseless images")
+    ap.add_argument("--shift-sigma", default=None, help="floors: apply the shift envelope (sigma in A, or 'fit')")
     ap.add_argument("--out", default=None, help="stream: output path")
     ap.add_argument("--files", nargs="+", default=[], help="floors: moment files")
     a = ap.parse_args()

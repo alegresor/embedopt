@@ -149,6 +149,17 @@ class OracleMomentReward(Reward):
                                           m3=env("MOMENT_M3", "block", str), drop=env("MOMENT_M12_DROP", 2, int),
                                           rcond=env("MOMENT_M3_RCOND", 1e-6, float),
                                           rcond_b=env("MOMENT_M3B_RCOND", 1e-9, float), all_variants=img_variants)
+                # Random in-plane shifts: exact Gaussian envelope on the model moments (moments.shift_env), with
+                # sigma fixed (MOMENT_SHIFT_SIGMA=<A>) or fitted at every evaluation (MOMENT_SHIFT_SIGMA=fit)
+                self.shift_env, self.shift_mode, self.shift_sigma = None, env("MOMENT_SHIFT_SIGMA", "", str), None
+                if self.shift_mode:
+                    from moments.shift_env import ShiftEnvelope
+
+                    self.img_wide = ImageMoments(np.arange(1, n_kappa + 1) / (n_kappa * resolution), r_max,
+                                                 L=self.inv.L, nb3=self.img.nb3, Q3=self.img.Q3 + 12,
+                                                 stride3=self.img.stride3, chunk=self.img.chunk, dev=dev)
+                    self.shift_env = ShiftEnvelope(self.img, self.img_wide)
+                    logger.info(f"[OracleMoment] shift envelope on the model moments: sigma {self.shift_mode}")
                 extra = ""
                 if hasattr(self.img_loss, "Ct"):  # per-degree error of the data's C_l (from c2) vs x*'s
                     C0 = self.img.moments(A_ref, third=False)["C"][: self.img_loss.lw]
@@ -197,7 +208,18 @@ class OracleMomentReward(Reward):
     def img_losses(self, A, third=None):
         """Image-space (m12, m3 or None) of coefficients A against the image data."""
         third = self.order >= 3 if third is None else third
-        return self.img_loss(self.img.moments(A, third))
+        if self.shift_env is None:
+            return self.img_loss(self.img.moments(A, third))
+        m = self.img.moments(A, third=False)
+        if self.shift_mode == "fit":
+            s = self.shift_env.fit_sigma(m["a"].detach(), m["c2"].detach(),
+                                         lambda a_, c2_, C_: self.img_loss.m12(dict(a=a_, c2=c2_, C=C_)))
+        else:
+            s = float(self.shift_mode)
+        self.shift_sigma = s
+        a2, c22, C2 = self.shift_env.apply12(m["a"], m["c2"], s)
+        c3 = self.shift_env.apply3(self.img_wide.c3(A), s) if third else None
+        return self.img_loss(dict(a=a2, c2=c22, C=C2, c3=c3))
 
     def losses(self, x, s=0.0, space=None, third=None):
         """x: (N_model_atoms, 3) in model order; s: DW positional uncertainty (A); space: invariant | image (default:
@@ -221,7 +243,7 @@ class OracleMomentReward(Reward):
             xc = x[self.keep].detach().cpu().numpy()
             rp, rm = kabsch_rmsd(self.ca_ref, xc[self.ca_pred])
             rec = dict(step=len(self.trace), t=NOISE["t"], s=s, m12=m12.item(), m3=None if m3 is None else m3.item(),
-                       rmsd=float(rp), rmsd_mirror=float(rm), space=self.space, dt=step_dt,
+                       rmsd=float(rp), rmsd_mirror=float(rm), space=self.space, dt=step_dt, shift_sigma=getattr(self, "shift_sigma", None),
                        mem=torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else None)
             self.trace.append(rec)
             logger.info(f"[OracleMoment] t {rec['t'] or float('nan'):.3g}, s {s:.2f}A, m12 {rec['m12']:.4e}"
