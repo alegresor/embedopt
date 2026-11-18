@@ -222,7 +222,7 @@ def stack_batches(sim_dir, batch=1024):
                 yield np.asarray(data[[k for k, _ in sel]], np.float64), np.array([d for _, d in sel])
 
 
-def stream_batches(sim_dir, n, seed, batch=1024, clean=False, ctf=True):
+def stream_batches(sim_dir, n, seed, batch=1024, clean=False, ctf=True, shift=0.0):
     """Yields freshly simulated batches (same volume, CTF set and noise level as DIR/sim.json)."""
     import mrcfile
 
@@ -232,7 +232,7 @@ def stream_batches(sim_dir, n, seed, batch=1024, clean=False, ctf=True):
     vol = mrcfile.read(f"{sim_dir}/truth.mrc")
     defoci = meta["defoci"] if ctf else []
     nv = None if clean else meta["noise_var"]
-    sim = make_sim(vol, meta["pixel"], n, defoci, seed, nv) if ctf else make_sim_noctf(vol, meta["pixel"], n, seed, nv)
+    sim = make_sim(vol, meta["pixel"], n, defoci, seed, nv, shift) if ctf else make_sim_noctf(vol, meta["pixel"], n, seed, nv)
     for i in range(0, n, batch):
         imgs = (sim.clean_images if clean else sim.images)[i:i + batch].asnumpy().astype(np.float64)
         d = np.asarray(defoci)[sim.filter_indices[i:i + batch]] if ctf else np.zeros(len(imgs))
@@ -251,11 +251,19 @@ def make_sim_noctf(vol, p, n, seed, noise_var=None):
     return Simulation(**kw)
 
 
-def accumulate(G, batches, defoci, dev, log_every=100000):
+def accumulate(G, batches, defoci, dev, log_every=100000, noise_est=None):
+    """noise_est: list to which per-batch estimates of the pixel noise variance are appended (from the image corners,
+    outside the inscribed circle of the box, where for these boxes only noise remains), or None."""
     defoci = np.asarray(defoci) if len(defoci) else np.zeros(1)
     acc = Accumulator(G, len(defoci), dev)
     t0, seen = time.time(), 0
+    corner = None
     for imgs, d in batches:
+        if noise_est is not None:
+            if corner is None:
+                n = np.arange(imgs.shape[-1]) - imgs.shape[-1] / 2
+                corner = (n[:, None] ** 2 + n[None, :] ** 2) > (imgs.shape[-1] / 2) ** 2
+            noise_est.append(float(imgs[:, corner].var(axis=1).mean()))
         grp = np.abs(d[:, None] - defoci[None]).argmin(1)
         acc.add(G.coeffs(imgs), grp)
         seen += len(imgs)
@@ -339,12 +347,39 @@ def cmd_stack(a):
 
 
 def cmd_stream(a):
+    """Options for realistic nuisances (the images are unchanged by the first two):
+    --defocus-error S : the estimator uses defocus values perturbed by N(0, S^2) A per defocus group (as a per-
+                        micrograph CTF estimate would be), instead of the true ones;
+    --noise-est       : the noise variance is estimated from the image corners instead of the true value;
+    --shift S         : the images have Gaussian in-plane shifts of standard deviation S A (not corrected)."""
     meta, atoms, G, dev = setup(a.sim)
     Sig0, P0 = noise_terms(G, meta, a.sim)
-    acc = accumulate(G, stream_batches(a.sim, a.n, a.seed, a.batch), meta["defoci"], dev)
-    out = f"{a.sim}/moments_N{a.n}_stream.npz"
-    acc.save(out, ctf_values(meta["defoci"], G.kappa, G.p), meta["noise_var"], Sig0, P0)
+    est = [] if a.noise_est else None
+    acc = accumulate(G, stream_batches(a.sim, a.n, a.seed, a.batch, shift=a.shift), meta["defoci"], dev, noise_est=est)
+    defoci = np.asarray(meta["defoci"], float)
+    if a.defocus_error > 0:
+        defoci = defoci + np.random.default_rng(a.seed + 31337).standard_normal(len(defoci)) * a.defocus_error
+        print(f"  estimator defocus values (true + error): {np.round(defoci).tolist()}")
+    sigma2 = float(np.mean(est)) if est is not None else meta["noise_var"]
+    if est is not None:
+        print(f"  noise variance estimated from the corners: {sigma2:.4e} (true {meta['noise_var']:.4e}, "
+              f"ratio {sigma2 / meta['noise_var']:.4f})")
+    out = a.out or f"{a.sim}/moments_N{a.n}_stream{a.suffix}.npz"
+    acc.save(out, ctf_values(defoci, G.kappa, G.p), sigma2, Sig0, P0)
     print(f"wrote {out}")
+
+
+def cmd_floors(a):
+    """x* vs data losses and relative errors of the given moment files (exact model on the same grid)."""
+    meta, atoms, G, dev = setup(a.sim)
+    exact, im, _ = model_moments(G, atoms, dev)
+    ex = {k: v.cpu().numpy() for k, v in exact.items()}
+    for f in a.files:
+        d = dict(np.load(f))
+        lv = losses_vs(d, im, ex)
+        e = {k: rel(d[k], ex[k]) for k in ("a", "c2", "c3")}
+        print(f"{os.path.basename(f):<44} rel err a {e['a']:.1e} c2 {e['c2']:.1e} c3 {e['c3']:.1e}; x* vs data: "
+              f"m12w {lv['m12w_img']:.1e} m3wblock {lv['m3b_img']:.1e}", flush=True)
 
 
 def cmd_checks(a):
@@ -400,14 +435,20 @@ def cmd_checks(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["stack", "stream", "checks"])
+    ap.add_argument("cmd", choices=["stack", "stream", "checks", "floors"])
     ap.add_argument("--sim", required=True)
     ap.add_argument("--n", type=int, default=1000000)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--ncal", type=int, default=20000, help="images for the calibration checks")
     ap.add_argument("--batch", type=int, default=512)
+    ap.add_argument("--defocus-error", type=float, default=0.0, help="stream: defocus error per group (A)")
+    ap.add_argument("--noise-est", action="store_true", help="stream: estimate the noise variance from the corners")
+    ap.add_argument("--shift", type=float, default=0.0, help="stream: in-plane shift std (A), uncorrected")
+    ap.add_argument("--suffix", default="", help="stream: output name suffix")
+    ap.add_argument("--out", default=None, help="stream: output path")
+    ap.add_argument("--files", nargs="+", default=[], help="floors: moment files")
     a = ap.parse_args()
-    dict(stack=cmd_stack, stream=cmd_stream, checks=cmd_checks)[a.cmd](a)
+    dict(stack=cmd_stack, stream=cmd_stream, checks=cmd_checks, floors=cmd_floors)[a.cmd](a)
 
 
 if __name__ == "__main__":

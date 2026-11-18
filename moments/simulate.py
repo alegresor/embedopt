@@ -85,7 +85,8 @@ def write_pdb(path, atoms, box):
     f.write(path)
 
 
-def make_sim(vol, p, n, defoci, seed, noise_var=None):
+def make_sim(vol, p, n, defoci, seed, noise_var=None, shift=0.0):
+    """shift: standard deviation (A) of Gaussian in-plane particle shifts (0: centred), from an independent stream."""
     from aspire.noise import WhiteNoiseAdder
     from aspire.operators import RadialCTFFilter
     from aspire.source import Simulation
@@ -97,8 +98,10 @@ def make_sim(vol, p, n, defoci, seed, noise_var=None):
     # makes each defocus group cover a different slice of the first Euler angle (pose-defocus correlation). That is
     # harmless for reconstruction but biases any CTF-weighted moment estimator.
     fi = np.random.default_rng(seed + 7919).integers(0, len(fs), n) if fs else None
+    off = (np.random.default_rng(seed + 104729).standard_normal((n, 2)) * shift / p).astype(np.float32) if shift \
+        else np.zeros((n, 2), np.float32)
     kw = dict(L=L, n=n, vols=Volume(vol, pixel_size=p), unique_filters=fs, filter_indices=fi,
-              offsets=np.zeros((n, 2), np.float32), amplitudes=np.ones(n, np.float32), seed=seed, pixel_size=p)
+              offsets=off, amplitudes=np.ones(n, np.float32), seed=seed, pixel_size=p)
     if noise_var is not None and noise_var > 0:
         kw["noise_adder"] = WhiteNoiseAdder(var=float(noise_var), seed=seed + 1000)
     return Simulation(**kw)
