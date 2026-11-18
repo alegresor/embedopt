@@ -299,6 +299,43 @@ def model_moments(G, atoms, dev, coords=None):
     return {k: v for k, v in m.items() if v is not None}, im, A
 
 
+def cmd_fitsigma(a):
+    """Shift sigma (A) of the Gaussian envelope that best fits the data's m12 (whitened) for a given structure:
+    --files DATA.npz --model STRUCTURE (any structure file, e.g. the best current prediction; heavy atoms used)."""
+    import biotite.structure.io as bio
+
+    from moments.image_moments import ImageLoss
+    from moments.shift_env import ShiftEnvelope
+
+    meta, atoms, G, dev = setup(a.sim)
+    st = bio.load_structure(a.model)
+    st = st[st.element != "H"]
+    wide, ims = model_moments_wide(G, atoms, dev, 12)
+    env = ShiftEnvelope(ims, wide)
+    A = torch.as_tensor(coef_of(G, st), dtype=torch.complex128, device=dev)
+    d = dict(np.load(a.files[0]))
+    T = {k: torch.as_tensor(np.asarray(v), dtype=torch.complex128, device=dev) for k, v in d.items() if k in ("a", "c2", "c3")}
+    lo = ImageLoss(T, ims, m12="white")
+    m0 = ims.moments(A, third=False)
+    s = env.fit_sigma(m0["a"], m0["c2"], lambda a_, c2_, C_: lo.m12(dict(a=a_, c2=c2_, C=C_), "white"))
+    print(f"{s:.4f}")
+
+
+def cmd_shiftsigma(a):
+    """Shift sigma (A) from per-particle shift estimates (true shifts of the stream simulation + N(0, E^2) error per
+    axis), as a picking / 2D-classification step would provide: the pooled standard deviation of the estimates."""
+    import mrcfile
+
+    from moments.simulate import make_sim
+
+    meta = json.load(open(f"{a.sim}/sim.json"))
+    vol = mrcfile.read(f"{a.sim}/truth.mrc")
+    sim = make_sim(vol, meta["pixel"], a.n, meta["defoci"], a.seed, None, a.shift)
+    t = np.asarray(sim.offsets, float) * meta["pixel"]
+    est = t + a.est_error * np.random.default_rng(a.seed + 777).standard_normal(t.shape)
+    print(f"{np.sqrt((est ** 2).mean()):.4f}")
+
+
 def coef_of(G, atoms):
     from moments import image_checks as ic
     from moments.invariants import form_factors
@@ -489,7 +526,7 @@ def cmd_checks(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["stack", "stream", "checks", "floors"])
+    ap.add_argument("cmd", choices=["stack", "stream", "checks", "floors", "fitsigma", "shiftsigma"])
     ap.add_argument("--sim", required=True)
     ap.add_argument("--n", type=int, default=1000000)
     ap.add_argument("--seed", type=int, default=1)
@@ -504,8 +541,11 @@ def main():
     ap.add_argument("--shift-sigma", default=None, help="floors: apply the shift envelope (sigma in A, or 'fit')")
     ap.add_argument("--out", default=None, help="stream: output path")
     ap.add_argument("--files", nargs="+", default=[], help="floors: moment files")
+    ap.add_argument("--model", default=None, help="fitsigma: structure file")
+    ap.add_argument("--est-error", type=float, default=0.3, help="shiftsigma: per-axis error of the shift estimates (A)")
     a = ap.parse_args()
-    dict(stack=cmd_stack, stream=cmd_stream, checks=cmd_checks, floors=cmd_floors)[a.cmd](a)
+    dict(stack=cmd_stack, stream=cmd_stream, checks=cmd_checks, floors=cmd_floors, fitsigma=cmd_fitsigma,
+         shiftsigma=cmd_shiftsigma)[a.cmd](a)
 
 
 if __name__ == "__main__":
