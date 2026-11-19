@@ -35,6 +35,7 @@ LR         ?= 0.1
 RES        ?= 5.0
 LB         ?= 24
 LAMBDA3    ?= 1.0
+M12_EPS    ?= 0.0
 NKAPPA     ?= 16
 DW         ?= 0
 SPACE      ?= invariant
@@ -78,7 +79,7 @@ DATA_SRC   = $(if $(filter exact,$(1)),exact,$(abspath $(if $(filter images,$(1)
 RUN_NAME   = $(if $(filter base,$(METHOD)),base,$(if $(filter map,$(METHOD)),map$(MTAG)_lr$(LR),moment$(ORDER)$(if $(filter 1,$(DW)),dw,)$(SPACE_TAG)$(DTAG)$(VTAG)_lr$(LR)$(RES_TAG)))$(TAG)
 RUN_CFG    = $(BENCH)/stage3a_cfgs/$(SYSTEM)_$(RUN_NAME).json
 PARTIAL_ENV = $(if $(INIT),PARTIAL_INIT=$(abspath $(INIT)) PARTIAL_SIGMA=$(SIGMA0),)
-MOMENT_ENV = $(PARTIAL_ENV) MOMENT_DW=$(DW) MOMENT_LB=$(LB) MOMENT_LAMBDA3=$(LAMBDA3) MOMENT_NKAPPA=$(NKAPPA) \
+MOMENT_ENV = $(PARTIAL_ENV) MOMENT_DW=$(DW) MOMENT_LB=$(LB) MOMENT_LAMBDA3=$(LAMBDA3) MOMENT_M12_EPS=$(M12_EPS) MOMENT_NKAPPA=$(NKAPPA) \
              MOMENT_SPACE=$(SPACE) MOMENT_DATA=$(call DATA_SRC,$(DATA)) MOMENT_NB3=$(NB3) MOMENT_Q3=$(Q3) MOMENT_C3_CHUNK=$(C3_CHUNK) \
              MOMENT_S3STRIDE=$(S3STRIDE) MOMENT_M12=$(M12) MOMENT_M3=$(M3) MOMENT_M12_DROP=$(M12_DROP) \
              MOMENT_M3_RCOND=$(M3_RCOND) MOMENT_M3B_RCOND=$(M3B_RCOND) MOMENT_SHIFT_SIGMA=$(SHIFT_SIGMA)

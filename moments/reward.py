@@ -23,7 +23,7 @@ invariants: a, c2_q (in-plane Fourier coefficients of the second moment) and c3_
 Debye-Waller weighting is not available in image space.
 
 Configuration (environment variables, set by the Makefile): MOMENT_ORDER (2|3), MOMENT_DW (0|1), MOMENT_LB (bispectrum
-bandlimit), MOMENT_LAMBDA3, MOMENT_NKAPPA, MOMENT_SPACE (invariant|image), MOMENT_DATA (exact|<npz>), MOMENT_NB3,
+bandlimit), MOMENT_LAMBDA3, MOMENT_M12_EPS, MOMENT_NKAPPA, MOMENT_SPACE (invariant|image), MOMENT_DATA (exact|<npz>), MOMENT_NB3,
 MOMENT_Q3, MOMENT_S3STRIDE (0: lowest NB3 shells; k: every k-th shell), MOMENT_C3_CHUNK, MOMENT_M12 (plain|white),
 MOMENT_M3 (block|perq|white|wblock), MOMENT_M12_DROP, MOMENT_M3_RCOND, MOMENT_M3B_RCOND (see moments.image_moments.ImageLoss). The resolution comes from the reward params of the JSON config.
 Per-step traces (t, s_t, m12, m3 as optimized, CA RMSD, wall time per diffusion step, peak GPU memory) are written to <trajectory dir>/moment_trace.json.
@@ -103,6 +103,8 @@ class OracleMomentReward(Reward):
         CURRENT["seed"] = int(seed.group(1)) if seed else None
         self.trace = []
         self.lam3 = env("MOMENT_LAMBDA3", 1.0, float)
+        # loss = (m12 + eps) * m3^lambda: eps > 0 caps the relative weight of m12 once it is small (MOMENT_M12_EPS)
+        self.m12_eps = env("MOMENT_M12_EPS", 0.0, float)
         self.dev = dev = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ref = PDBFile.read(ref_pdb_path).get_structure(model=1)
 
@@ -238,7 +240,7 @@ class OracleMomentReward(Reward):
         for i in range(sample.shape[-3]):
             x = sample[..., i, :, :]
             m12, m3 = self.losses(x, s)
-            loss = m12 if m3 is None else m12 * m3.pow(self.lam3)
+            loss = m12 if m3 is None else (m12 + self.m12_eps) * m3.pow(self.lam3)
             rewards.append(-loss)
             xc = x[self.keep].detach().cpu().numpy()
             rp, rm = kabsch_rmsd(self.ca_ref, xc[self.ca_pred])
