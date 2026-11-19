@@ -47,13 +47,15 @@ RES, NKAPPA = 5.0, 16
 class PolarGrid:
     """The reward's polar grid for a system: shells, n_phi, L, third-order shells; and the NUFFT sampler."""
 
-    def __init__(self, atoms, L_img, p, nb3=8, Q3=16, stride3=0):
+    def __init__(self, atoms, L_img, p, nb3=8, Q3=16, stride3=0, nphi=None):
         x = atoms.coord.astype(np.float64)
         x -= x.mean(0)
         self.kappa = np.arange(1, NKAPPA + 1) / (NKAPPA * RES)
         self.r_max = R_SAFETY * np.linalg.norm(x, axis=1).max()
         self.shells3 = third_shells(NKAPPA, nb3, stride3)
         self.L, self.LB, self.nphi = grid(self.kappa, self.r_max, self.shells3)
+        if nphi:  # finer in-plane sampling (more in-plane coefficients), e.g. for the astigmatic estimator
+            self.nphi = int(nphi)
         self.nb3, self.Q3, self.L_img, self.p = nb3, Q3, L_img, p
         self.s = L_img * p**3
         phi = 2 * np.pi * np.arange(self.nphi) / self.nphi
@@ -227,7 +229,16 @@ def stack_batches(sim_dir, batch=1024):
                 yield np.asarray(data[[k for k, _ in sel]], np.float64), np.array([d for _, d in sel])
 
 
-def stream_batches(sim_dir, n, seed, batch=1024, clean=False, ctf=True, shift=0.0):
+def astig_filters(meta, astig, seed):
+    """Astigmatic CTFs per defocus group: defocus_u/v = mean -/+ astig/2, angle uniform in [0, pi)."""
+    from moments.ctf2d import make_filters
+
+    d = np.asarray(meta["defoci"], float)
+    ang = np.random.default_rng(seed + 999).uniform(0, np.pi, len(d))
+    return make_filters(d + astig / 2, d - astig / 2, ang), ang
+
+
+def stream_batches(sim_dir, n, seed, batch=1024, clean=False, ctf=True, shift=0.0, filters=None):
     """Yields freshly simulated batches (same volume, CTF set and noise level as DIR/sim.json)."""
     import mrcfile
 
@@ -237,7 +248,8 @@ def stream_batches(sim_dir, n, seed, batch=1024, clean=False, ctf=True, shift=0.
     vol = mrcfile.read(f"{sim_dir}/truth.mrc")
     defoci = meta["defoci"] if ctf else []
     nv = None if clean else meta["noise_var"]
-    sim = make_sim(vol, meta["pixel"], n, defoci, seed, nv, shift) if ctf else make_sim_noctf(vol, meta["pixel"], n, seed, nv)
+    sim = make_sim(vol, meta["pixel"], n, defoci, seed, nv, shift, filters) if ctf \
+        else make_sim_noctf(vol, meta["pixel"], n, seed, nv)
     off = np.asarray(sim.offsets, float) * meta["pixel"]                  # A, (x, y)
     for i in range(0, n, batch):
         imgs = (sim.clean_images if clean else sim.images)[i:i + batch].asnumpy().astype(np.float64)
@@ -438,6 +450,73 @@ def cmd_stream(a):
     print(f"wrote {out}")
 
 
+def cmd_stream2d(a):
+    """Astigmatic CTFs and/or colored noise; several estimates from one pass over the same images.
+    --astig D        : astigmatic CTF per defocus group (defocus_u/v = mean -/+ D/2, random angle per group)
+    --noise colored  : stationary noise with more power at low frequency (moments.ctf2d.radial_psd), same variance
+    --estimators     : comma list of radial (radial CTF at the mean defocus), 2d (astigmatic least squares), 2d0
+                       (the same with the angular-mean CTF only, i.e. astigmatism ignored)
+    --psds           : comma list of true (the simulated spectrum), est (from the image corners), white (flat, with
+                       the corner-estimated variance)
+    Output: SIM/moments_N<n>_stream<suffix>_<estimator>_<psd>.npz"""
+    from moments import ctf2d as C
+
+    meta, atoms, G0, dev = setup(a.sim)
+    M2, M3 = 6, 2
+    nphi = int(16 * np.ceil(2 * (G0.L + 3 * M2 + 2) / 16))
+    G = PolarGrid(atoms, meta["L"], meta["pixel"], nphi=nphi)
+    ests, psds = a.estimators.split(","), a.psds.split(",")
+    filters, ang = astig_filters(meta, a.astig, a.seed) if a.astig > 0 else (None, None)
+    colored = a.noise == "colored"
+    S_true = C.radial_psd("colored" if colored else "white", meta["L"], meta["pixel"], 0.0 if a.clean else meta["noise_var"])
+    defoci = np.asarray(meta["defoci"], float)
+    acc = Accumulator(G, len(defoci), dev) if "radial" in ests else None
+    acc2 = C.Accumulator2D(G, len(defoci), dev, M2, M3) if any(e.startswith("2d") for e in ests) else None
+    cp = C.CornerPSD(meta["L"], meta["pixel"])
+    rng = np.random.default_rng(a.seed + 2024)
+    t0, seen = time.time(), 0
+    for b in stream_batches(a.sim, a.n, a.seed, a.batch, clean=colored or a.clean, filters=filters):
+        imgs, d = b[0], b[1]
+        if colored and not a.clean:
+            imgs = C.add_noise(imgs, S_true, rng)
+        cp.add(imgs)
+        grp = np.abs(d[:, None] - defoci[None]).argmin(1)
+        X = G.coeffs(imgs)
+        if acc is not None:
+            acc.add(X, grp)
+        if acc2 is not None:
+            acc2.add(X, grp)
+        seen += len(imgs)
+        if seen % 100000 < len(imgs):
+            print(f"    {seen} images ({time.time() - t0:.0f}s)", flush=True)
+    S_est = cp.spectrum()
+    k = np.fft.fftfreq(meta["L"], d=meta["pixel"])
+    r = np.sqrt(k[:, None] ** 2 + k[None, :] ** 2)
+    sel = r < 0.25
+    if a.clean:
+        S_est = np.zeros_like(S_true)
+    else:
+        print(f"  noise spectrum: corner estimate / true, median {np.median(S_est[sel] / S_true[sel]):.4f}, "
+          f"10-90% [{np.percentile(S_est[sel] / S_true[sel], 10):.3f}, {np.percentile(S_est[sel] / S_true[sel], 90):.3f}]"
+          f" (|k| < 0.25 A^-1); variance est/true {S_est.mean() / S_true.mean():.4f}")
+    spectra = dict(true=S_true, est=S_est, white=np.full_like(S_true, S_est.mean()))
+    qmax2, Q3m = G.L + M2, G.Q3 + M3
+    H2 = C.polar_ctf(filters, G.kappa, G.nphi, G.p) if filters is not None else \
+        np.repeat(ctf_values(defoci, G.kappa, G.p)[:, :, None], G.nphi, axis=2)
+    for ps in psds:
+        t1 = time.time()
+        Sig, P = C.noise_cov_psd(G, spectra[ps], qmax2, Q3m, dev)
+        for e in ests:
+            if e == "radial":
+                m = acc.estimate(ctf_values(defoci, G.kappa, G.p), 1.0, Sig[qmax2:qmax2 + G.L + 1], P)
+            else:
+                m = acc2.estimate(H2, Sig, P, qmax2, Q3m, **(dict(M2=0, M3=0) if e == "2d0" else {}))
+                print(f"  {e}/{ps}: c3 conjugate gradients {acc2.cg}")
+            out = f"{a.sim}/moments_N{a.n}_stream{a.suffix}_{e}_{ps}.npz"
+            np.savez(out, **m, kappa=G.kappa, nb3=G.nb3, Q3=G.Q3, L=G.L, shells3=G.shells3, n_images=int(seen))
+            print(f"  wrote {out} ({time.time() - t1:.0f}s)", flush=True)
+
+
 def cmd_floors(a):
     """x* vs data losses and relative errors of the given moment files (exact model on the same grid)."""
     meta, atoms, G, dev = setup(a.sim)
@@ -526,7 +605,7 @@ def cmd_checks(a):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["stack", "stream", "checks", "floors", "fitsigma", "shiftsigma"])
+    ap.add_argument("cmd", choices=["stack", "stream", "checks", "floors", "fitsigma", "shiftsigma", "stream2d"])
     ap.add_argument("--sim", required=True)
     ap.add_argument("--n", type=int, default=1000000)
     ap.add_argument("--seed", type=int, default=1)
@@ -543,9 +622,13 @@ def main():
     ap.add_argument("--files", nargs="+", default=[], help="floors: moment files")
     ap.add_argument("--model", default=None, help="fitsigma: structure file")
     ap.add_argument("--est-error", type=float, default=0.3, help="shiftsigma: per-axis error of the shift estimates (A)")
+    ap.add_argument("--astig", type=float, default=0.0, help="stream2d: astigmatism (defocus_u - defocus_v, A)")
+    ap.add_argument("--noise", default="white", choices=["white", "colored"], help="stream2d: noise spectrum")
+    ap.add_argument("--estimators", default="2d", help="stream2d: comma list of radial, 2d, 2d0")
+    ap.add_argument("--psds", default="true", help="stream2d: comma list of true, est, white")
     a = ap.parse_args()
     dict(stack=cmd_stack, stream=cmd_stream, checks=cmd_checks, floors=cmd_floors, fitsigma=cmd_fitsigma,
-         shiftsigma=cmd_shiftsigma)[a.cmd](a)
+         shiftsigma=cmd_shiftsigma, stream2d=cmd_stream2d)[a.cmd](a)
 
 
 if __name__ == "__main__":

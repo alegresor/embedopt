@@ -85,7 +85,7 @@ def write_pdb(path, atoms, box):
     f.write(path)
 
 
-def make_sim(vol, p, n, defoci, seed, noise_var=None, shift=0.0):
+def make_sim(vol, p, n, defoci, seed, noise_var=None, shift=0.0, filters=None):
     """shift: standard deviation (A) of Gaussian in-plane particle shifts (0: centred), from an independent stream."""
     from aspire.noise import WhiteNoiseAdder
     from aspire.operators import RadialCTFFilter
@@ -93,7 +93,8 @@ def make_sim(vol, p, n, defoci, seed, noise_var=None, shift=0.0):
     from aspire.volume import Volume
 
     L = vol.shape[0]
-    fs = [RadialCTFFilter(voltage=300, defocus=float(d), Cs=2.7, alpha=0.1) for d in defoci]
+    fs = filters if filters is not None else [RadialCTFFilter(voltage=300, defocus=float(d), Cs=2.7, alpha=0.1)
+                                              for d in defoci]
     # Filter (defocus) assignment from an independent stream: ASPIRE draws it with the same seed as the rotations, which
     # makes each defocus group cover a different slice of the first Euler angle (pose-defocus correlation). That is
     # harmless for reconstruction but biases any CTF-weighted moment estimator.
