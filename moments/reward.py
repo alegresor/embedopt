@@ -180,6 +180,12 @@ class OracleMomentReward(Reward):
                                                      device=dev)
                     if self.pose_mode == "oracle":
                         self.pose_nu = self.pose.of_function(VMFMixture.default())
+                    elif self.pose_mode == "fixed":  # theta from a json file (MOMENT_POSE_THETA), e.g. fitted in pass 1
+                        import json as _json
+
+                        self.pose_dens = SHDensity(Pd)
+                        self.pose_theta = np.asarray(_json.load(open(env("MOMENT_POSE_THETA", "", str))), float)
+                        self.pose_nu = self.pose.of_theta(self.pose_dens, self.pose_theta)
                     elif self.pose_mode == "fit":
                         self.pose_dens = SHDensity(Pd)
                         self.pose_theta = np.zeros(self.pose_dens.K)
@@ -188,7 +194,7 @@ class OracleMomentReward(Reward):
                         self.pose_colloc = collocation(400)
                         self.pose_calls, self.pose_info = 0, {}
                     else:
-                        raise ValueError(f"MOMENT_POSE must be uniform, oracle or fit, not {self.pose_mode}")
+                        raise ValueError(f"MOMENT_POSE must be uniform, oracle, fit or fixed, not {self.pose_mode}")
                     logger.info(f"[OracleMoment] viewing density: {self.pose_mode}, degree {Pd}"
                                 + (f", {self.pose_dens.K} parameters, QP every {self.pose_every} calls"
                                    if self.pose_mode == "fit" else ""))
