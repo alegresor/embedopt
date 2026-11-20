@@ -16,8 +16,9 @@ the atoms by a type-3 NUFFT of the projected atom positions (no spherical-harmon
 with (x', y') the first two components of g^T q_n. This is the reference for the convention check and for tests; the
 fast model side used in the reward (weighted quadrature on the spherical-harmonic node images) follows in turn 2.
 
-Usage (convention check, noiseless CTF-free images with non-uniform poses vs the model with the true density):
-    python -m moments.poses check --sim out/8K9Z_A/noise_snr16 --n 20000
+Usage:
+    python -m moments.poses check  --sim out/8K9Z_A/noise_snr16 --n 20000   (noiseless check vs the model)
+    python -m moments.poses stream --sim out/8K9Z_A/noise_snr16 --n 100000  (data with CTF and noise)
 """
 
 import argparse
@@ -224,15 +225,44 @@ def cmd_check(a):
     json.dump(out, open(f"{a.sim}/poses_check.json", "w"), indent=1)
 
 
+def cmd_stream(a):
+    """Particle images of x* with viewing directions from the default test density (moments.poses.VMFMixture), CTFs
+    and white noise as in DIR/sim.json, and their CTF-corrected, noise-debiased moments -> DIR/moments_N<n>_poses.npz."""
+    import mrcfile
+
+    from moments import image_data as D
+
+    meta, atoms, G, dev = D.setup(a.sim)
+    vol = mrcfile.read(f"{a.sim}/truth.mrc")
+    nu = VMFMixture.default()
+    defoci = np.asarray(meta["defoci"], float)
+    rng = np.random.default_rng(a.seed)
+    acc = D.Accumulator(G, len(defoci), dev)
+    t0 = time.time()
+    for i in range(0, a.n, a.batch):
+        k = min(a.batch, a.n - i)
+        rots = rotations_from_dirs(nu.sample_dirs(k, rng), rng)
+        sim = make_sim_poses(vol, meta["pixel"], rots, defoci, seed=a.seed + i, noise_var=meta["noise_var"])
+        acc.add(G.coeffs(sim.images[:].asnumpy().astype(np.float64)), np.asarray(sim.filter_indices))
+        if (i // a.batch) % 50 == 0:
+            print(f"    {i + k} images ({time.time() - t0:.0f}s)", flush=True)
+    Sig0, P0 = D.noise_terms(G, meta, a.sim)
+    out = a.out or f"{a.sim}/moments_N{a.n}_poses{a.suffix}.npz"
+    acc.save(out, D.ctf_values(defoci, G.kappa, G.p), meta["noise_var"], Sig0, P0, extra=dict(density=json.dumps(nu.spec())))
+    print(f"wrote {out} ({time.time() - t0:.0f}s)")
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["check"])
+    ap.add_argument("cmd", choices=["check", "stream"])
     ap.add_argument("--sim", required=True)
     ap.add_argument("--n", type=int, default=20000)
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--batch", type=int, default=500)
+    ap.add_argument("--suffix", default="")
+    ap.add_argument("--out", default=None)
     a = ap.parse_args()
-    dict(check=cmd_check)[a.cmd](a)
+    dict(check=cmd_check, stream=cmd_stream)[a.cmd](a)
 
 
 if __name__ == "__main__":

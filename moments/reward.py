@@ -162,6 +162,36 @@ class OracleMomentReward(Reward):
                                                  stride3=self.img.stride3, chunk=self.img.chunk, dev=dev)
                     self.shift_env = ShiftEnvelope(self.img, self.img_wide)
                     logger.info(f"[OracleMoment] shift envelope on the model moments: sigma {self.shift_mode}")
+                # Non-uniform viewing density (moments.pose_moments): MOMENT_POSE = uniform (default) | oracle (the
+                # test density of moments.poses, MOMENT_POSE_P = 12) | fit (even real spherical harmonics up to
+                # MOMENT_POSE_P = 4, theta set by the exact QP every MOMENT_POSE_EVERY reward calls, nu >= 0 enforced
+                # at collocation points; the embedding gradient is taken at fixed theta)
+                self.pose_mode, self.pose = env("MOMENT_POSE", "uniform", str), None
+                if self.pose_mode != "uniform":
+                    from moments.image_moments import tables
+                    from moments.pose_moments import PoseMoments, SHDensity, collocation
+                    from moments.poses import VMFMixture
+
+                    Pd = env("MOMENT_POSE_P", 12 if self.pose_mode == "oracle" else 4, int)
+                    self.pose = PoseMoments(self.img.L, self.img.LB, self.img.nphi, n_kappa, self.img.shells3,
+                                            self.img.Q3, P=Pd, dtype=np.complex64, backend="torch", device=dev)
+                    beta, *_ = tables(self.img.L, self.img.LB, self.img.nphi, self.img.Q3)
+                    self.pose_Binv = torch.as_tensor(np.linalg.inv(beta.T / (4 * np.pi)), dtype=torch.complex64,
+                                                     device=dev)
+                    if self.pose_mode == "oracle":
+                        self.pose_nu = self.pose.of_function(VMFMixture.default())
+                    elif self.pose_mode == "fit":
+                        self.pose_dens = SHDensity(Pd)
+                        self.pose_theta = np.zeros(self.pose_dens.K)
+                        self.pose_nu = self.pose.uniform()
+                        self.pose_every = env("MOMENT_POSE_EVERY", 10, int)
+                        self.pose_colloc = collocation(400)
+                        self.pose_calls, self.pose_info = 0, {}
+                    else:
+                        raise ValueError(f"MOMENT_POSE must be uniform, oracle or fit, not {self.pose_mode}")
+                    logger.info(f"[OracleMoment] viewing density: {self.pose_mode}, degree {Pd}"
+                                + (f", {self.pose_dens.K} parameters, QP every {self.pose_every} calls"
+                                   if self.pose_mode == "fit" else ""))
                 extra = ""
                 if hasattr(self.img_loss, "Ct"):  # per-degree error of the data's C_l (from c2) vs x*'s
                     C0 = self.img.moments(A_ref, third=False)["C"][: self.img_loss.lw]
@@ -210,6 +240,8 @@ class OracleMomentReward(Reward):
     def img_losses(self, A, third=None):
         """Image-space (m12, m3 or None) of coefficients A against the image data."""
         third = self.order >= 3 if third is None else third
+        if getattr(self, "pose", None) is not None:
+            return self.img_loss(self.pose_moments(A, third))
         if self.shift_env is None:
             return self.img_loss(self.img.moments(A, third))
         m = self.img.moments(A, third=False)
@@ -222,6 +254,28 @@ class OracleMomentReward(Reward):
         a2, c22, C2 = self.shift_env.apply12(m["a"], m["c2"], s)
         c3 = self.shift_env.apply3(self.img_wide.c3(A), s) if third else None
         return self.img_loss(dict(a=a2, c2=c22, C=C2, c3=c3))
+
+    def pose_moments(self, A, third):
+        """Model moments under the current viewing density; in fit mode, theta is refitted by the exact QP every
+        pose_every calls (moments are affine in theta and the loss is a quadratic form: writeup, Unknown pose density)."""
+        from moments.pose_moments import combine, fit_theta
+
+        A = A.to(torch.complex64)
+        withC = lambda m: dict(m, C=(self.pose_Binv @ m["c2"].reshape(m["c2"].shape[0], -1)).reshape(m["c2"].shape))
+        if self.pose_mode == "fit":
+            if self.pose_calls % self.pose_every == 0:
+                with torch.no_grad():
+                    basis = self.pose.basis_moments(A.detach(), self.pose_dens, third=third)
+                    m0 = withC(combine(basis, self.pose_theta))
+                    n12 = float(self.img_loss.m12(m0))
+                    n3 = float(self.img_loss.m3(m0)) if third else 1.0
+                    J = lambda m: float(self.img_loss.m12(withC(m))) / n12 + (
+                        float(self.img_loss.m3(m)) / n3 if third else 0.0)
+                    self.pose_theta, self.pose_info = fit_theta(basis, J, self.pose_dens, self.pose_colloc,
+                                                                theta0=self.pose_theta)
+                self.pose_nu = self.pose.of_theta(self.pose_dens, self.pose_theta)
+            self.pose_calls += 1
+        return withC(self.pose.moments(A, *self.pose_nu, third=third))
 
     def losses(self, x, s=0.0, space=None, third=None):
         """x: (N_model_atoms, 3) in model order; s: DW positional uncertainty (A); space: invariant | image (default:
@@ -246,6 +300,8 @@ class OracleMomentReward(Reward):
             rp, rm = kabsch_rmsd(self.ca_ref, xc[self.ca_pred])
             rec = dict(step=len(self.trace), t=NOISE["t"], s=s, m12=m12.item(), m3=None if m3 is None else m3.item(),
                        rmsd=float(rp), rmsd_mirror=float(rm), space=self.space, dt=step_dt, shift_sigma=getattr(self, "shift_sigma", None),
+                       pose_theta=(self.pose_theta.tolist() if getattr(self, "pose_mode", "") == "fit" else None),
+                       pose_fit=(dict(self.pose_info) if getattr(self, "pose_mode", "") == "fit" else None),
                        mem=torch.cuda.max_memory_allocated() / 2**30 if torch.cuda.is_available() else None)
             self.trace.append(rec)
             logger.info(f"[OracleMoment] t {rec['t'] or float('nan'):.3g}, s {s:.2f}A, m12 {rec['m12']:.4e}"
