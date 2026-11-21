@@ -1,13 +1,13 @@
 #!/bin/bash
-# Viewing-density follow-ups (about 6-8 h). All chains: 10 seeds, eps = 0.1 unless noted, image data with
-# non-uniform viewing directions (moments.poses stream; VMFMixture.default()).
-# A. 8K9Z_A, localize: per-pass medians of the existing oracle and uniform-assumed chains.
-# B. 8K9Z_A, alternation (EM-like): theta from the uniform-assumed chain's lowest-m3 final structure
-#    (moments.pose_floors --model), passes 2-4 with that theta fixed (from the uniform pass 1); then a second round
-#    with theta from the first round's lowest-m3 final structure.
-# C. 8K9Z_A, the m12 balance: passes 2-4 of the oracle chain with eps = 0.
-# D. 8H1I_A, the same on a second system: non-uniform data (15 min), uniform-assumed chain, one alternation round,
-#    oracle chain.
+# Viewing-density follow-ups with the frame fix (about 11-12 h): the density is expressed in a frame of the molecule,
+# so x0hat is rotated into that frame before its moments are computed (oracle: x*; fixed theta: the structure it was
+# fitted from; fit: the previous fit's structure). The earlier oracle / fit / frozen arms lacked this.
+# All chains: 10 seeds, eps = 0.1 unless noted, image data with non-uniform viewing directions.
+# A. 8K9Z_A: oracle and fitted-every-10-calls chains again, with the frame fix (oracle2, fit2).
+# B. 8K9Z_A, alternation (EM-like): theta from the uniform-assumed chain's lowest-m3 final structure, passes 2-4 with
+#    that theta fixed in that structure's frame (from the uniform pass 1); a second round from round 1's best structure.
+# C. 8K9Z_A, the m12 balance: passes 2-4 of the oracle2 chain with eps = 0.
+# D. 8H1I_A: non-uniform data (15 min), uniform-assumed chain, one alternation round, oracle chain.
 #   setsid nohup bash experiments/pose_weekend.sh > out/pose_weekend.log 2>&1 < /dev/null &
 set -uo pipefail
 F=_seq80_seq30_seq15; EPS=1e-1
@@ -54,16 +54,11 @@ em_round() {  # em_round SYS FROM_FINAL_RUN PASS1 DTAG THETA_JSON
     python -m moments.pose_floors --sim out/$sys/noise_snr16 --model $m --out $th 2>&1 | grep -v INFO | tail -1 \
         | tee -a out/pose_weekend_thetas.log
     [ -f $th ] || return 1
-    restarts $sys $p1 $DT M12_EPS=$EPS POSE=fixed POSE_P=4 POSE_THETA=$th
+    restarts $sys $p1 $DT M12_EPS=$EPS POSE=fixed POSE_P=4 POSE_THETA=$th POSE_REF=$m
 }
 
-log "A. 8K9Z_A per-pass check of the oracle and uniform-assumed chains"
-RUNS=""
-for a in oracle uniform; do
-    RUNS="$RUNS moment2_imgd_poses${a}_w12_lr0.1"
-    for t in _seq80 _seq80_seq30 $F; do RUNS="$RUNS moment3_imgd_poses${a}_w12_m3wblock_lr0.1$t"; done
-done
-make check SYSTEM=8K9Z_A FIG=check_poses_passes CHECK_DATA=$(data 8K9Z_A) RUNS="$RUNS" > out/8K9Z_A/check_poses_passes.log 2>&1
+log "A. 8K9Z_A oracle chain with the frame fix";  chain 8K9Z_A _posesoracle2 POSE=oracle || log "A oracle FAILED"
+log "A. 8K9Z_A fitted chain with the frame fix";  chain 8K9Z_A _posesfit2 POSE=fit POSE_P=4 POSE_EVERY=10 || log "A fit FAILED"
 
 log "B. 8K9Z_A alternation, round 1"
 em_round 8K9Z_A moment3_imgd_posesuniform_w12_m3wblock_lr0.1$F moment2_imgd_posesuniform_w12_lr0.1 _posesem1 \
@@ -73,7 +68,7 @@ em_round 8K9Z_A moment3_imgd_posesem1_w12_m3wblock_lr0.1$F moment2_imgd_posesuni
     out/8K9Z_A/theta_em2.json || log "round 2 FAILED"
 
 log "C. 8K9Z_A oracle passes 2-4 with eps = 0"
-restarts 8K9Z_A moment2_imgd_posesoracle_w12_lr0.1 _posesoracleeps0 POSE=oracle M12_EPS=0 || log "C FAILED"
+restarts 8K9Z_A moment2_imgd_posesoracle2_w12_lr0.1 _posesoracleeps0 POSE=oracle M12_EPS=0 || log "C FAILED"
 
 log "D. 8H1I_A non-uniform data"
 [ -f $(data 8H1I_A) ] || python -m moments.poses stream --sim out/8H1I_A/noise_snr16 --n 100000 \
@@ -86,7 +81,7 @@ log "D. 8H1I_A oracle chain";  chain 8H1I_A _posesoracle POSE=oracle || log "D o
 
 log "checks and summary"
 R8="moment3_imgd_snr16n1e5eps1e-1_w12_m3wblock_lr0.1$F"
-for a in oracle uniform fit frozen em1 em2 oracleeps0; do R8="$R8 moment3_imgd_poses${a}_w12_m3wblock_lr0.1$F"; done
+for a in oracle oracle2 uniform fit fit2 frozen em1 em2 oracleeps0; do R8="$R8 moment3_imgd_poses${a}_w12_m3wblock_lr0.1$F"; done
 make check SYSTEM=8K9Z_A FIG=check_poses_weekend CHECK_DATA=$(data 8K9Z_A) RUNS="$R8" > out/8K9Z_A/check_poses_weekend.log 2>&1
 R1="moment3_imgd_snr16n1e5eps1e-1_w12_m3wblock_lr0.1$F"
 for a in uniform em1 oracle; do R1="$R1 moment3_imgd_poses${a}_w12_m3wblock_lr0.1$F"; done
@@ -96,27 +91,18 @@ import os, pandas as pd
 F = "_seq80_seq30_seq15"
 run = lambda a: f"moment3_imgd_poses{a}_w12_m3wblock_lr0.1{F}"
 ref = f"moment3_imgd_snr16n1e5eps1e-1_w12_m3wblock_lr0.1{F}"
-f = "out/8K9Z_A/check_poses_passes.csv"
-if os.path.isfile(f):
-    d = pd.read_csv(f)
-    print("A. 8K9Z_A per pass (core median / core<2): oracle | uniform assumed")
-    for k, t in enumerate(["", "_seq80", "_seq80_seq30", F], 1):
-        cells = []
-        for a in ("oracle", "uniform"):
-            r = f"moment2_imgd_poses{a}_w12_lr0.1" if k == 1 else f"moment3_imgd_poses{a}_w12_m3wblock_lr0.1{t}"
-            x = d[d.run == r]
-            cells.append(f"{x.core.median():5.2f} / {(x.core < 2).mean():4.0%}" if len(x) else "   (missing)  ")
-        print(f"  pass {k}: " + "  |  ".join(cells))
-arms = {"8K9Z_A": [("uniform poses, uniform model (reference)", ref), ("oracle", run("oracle")),
-                   ("oracle, eps = 0", run("oracleeps0")), ("uniform assumed", run("uniform")),
-                   ("fitted every 10 calls", run("fit")), ("frozen after pass 1", run("frozen")),
-                   ("alternation round 1", run("em1")), ("alternation round 2", run("em2"))],
+arms = {"8K9Z_A": [("uniform poses, uniform model (reference)", ref), ("oracle (frame fix)", run("oracle2")),
+                   ("oracle (frame fix), eps = 0", run("oracleeps0")), ("uniform assumed", run("uniform")),
+                   ("fitted every 10 calls (frame fix)", run("fit2")), ("alternation round 1", run("em1")),
+                   ("alternation round 2", run("em2")), ("old oracle (no frame fix)", run("oracle")),
+                   ("old fitted (no frame fix)", run("fit"))],
         "8H1I_A": [("uniform poses, uniform model (reference)", ref), ("oracle", run("oracle")),
                    ("uniform assumed", run("uniform")), ("alternation round 1", run("em1"))]}
 for s, lst in arms.items():
     f = f"out/{s}/check_poses_weekend.csv"
     if not os.path.isfile(f): print(f"\n{s}: no {f}"); continue
-    d = pd.read_csv(f); core = d.pivot_table(index="seed", columns="run", values="core"); o = run("oracle")
+    d = pd.read_csv(f); core = d.pivot_table(index="seed", columns="run", values="core")
+    o = run("oracle2") if s == "8K9Z_A" else run("oracle")
     print(f"\n=== {s}, final pass, 10 seeds\n{'arm':<44}{'median':>8}{'full':>7}{'core<2':>8}{'vs oracle':>20}{'sel.':>7}")
     for lab, r in lst:
         x = d[d.run == r]

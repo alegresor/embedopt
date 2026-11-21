@@ -166,7 +166,7 @@ class OracleMomentReward(Reward):
                 # test density of moments.poses, MOMENT_POSE_P = 12) | fit (even real spherical harmonics up to
                 # MOMENT_POSE_P = 4, theta set by the exact QP every MOMENT_POSE_EVERY reward calls, nu >= 0 enforced
                 # at collocation points; the embedding gradient is taken at fixed theta)
-                self.pose_mode, self.pose = env("MOMENT_POSE", "uniform", str), None
+                self.pose_mode, self.pose, self.pose_ref_ca = env("MOMENT_POSE", "uniform", str), None, None
                 if self.pose_mode != "uniform":
                     from moments.image_moments import tables
                     from moments.pose_moments import PoseMoments, SHDensity, collocation
@@ -178,14 +178,26 @@ class OracleMomentReward(Reward):
                     beta, *_ = tables(self.img.L, self.img.LB, self.img.nphi, self.img.Q3)
                     self.pose_Binv = torch.as_tensor(np.linalg.inv(beta.T / (4 * np.pi)), dtype=torch.complex64,
                                                      device=dev)
+                    # The density is expressed in a frame of the molecule: x0hat is rotated (no gradient through the
+                    # rotation) into that frame before its coefficients are computed. oracle: x*'s frame; fixed: the
+                    # frame of the structure theta was fitted from (MOMENT_POSE_REF); fit: the previous fit's frame.
+                    self.ca_pred_t = torch.as_tensor(self.ca_pred, device=dev)
                     if self.pose_mode == "oracle":
                         self.pose_nu = self.pose.of_function(VMFMixture.default())
+                        self.pose_ref_ca = torch.as_tensor(self.ca_ref, dtype=torch.float64, device=dev)
                     elif self.pose_mode == "fixed":  # theta from a json file (MOMENT_POSE_THETA), e.g. fitted in pass 1
                         import json as _json
 
                         self.pose_dens = SHDensity(Pd)
                         self.pose_theta = np.asarray(_json.load(open(env("MOMENT_POSE_THETA", "", str))), float)
                         self.pose_nu = self.pose.of_theta(self.pose_dens, self.pose_theta)
+                        import biotite.structure.io as _bio
+
+                        _st = _bio.load_structure(env("MOMENT_POSE_REF", "", str))
+                        _ca = _st.coord[_st.atom_name == "CA"]
+                        if len(_ca) != int(self.ca_pred.sum()):
+                            raise ValueError(f"MOMENT_POSE_REF has {len(_ca)} CA atoms, the model {int(self.ca_pred.sum())}")
+                        self.pose_ref_ca = torch.as_tensor(_ca, dtype=torch.float64, device=dev)
                     elif self.pose_mode == "fit":
                         self.pose_dens = SHDensity(Pd)
                         self.pose_theta = np.zeros(self.pose_dens.K)
@@ -261,6 +273,21 @@ class OracleMomentReward(Reward):
         c3 = self.shift_env.apply3(self.img_wide.c3(A), s) if third else None
         return self.img_loss(dict(a=a2, c2=c22, C=C2, c3=c3))
 
+    def _pose_frame(self, x):
+        """Rotate x into the frame of the viewing density (Kabsch on CA atoms, rotation not differentiated)."""
+        ref = self.pose_ref_ca
+        if ref is not None:
+            with torch.no_grad():
+                P = x[self.ca_pred_t].detach().double()
+                Pc, Qc = P - P.mean(0), ref - ref.mean(0)
+                U, _, Vt = torch.linalg.svd(Pc.T @ Qc)
+                d = torch.sign(torch.linalg.det(Vt.T @ U.T))
+                R = Vt.T @ torch.diag(torch.stack([torch.ones_like(d), torch.ones_like(d), d])) @ U.T
+            x = (x - x.mean(0)) @ R.T.to(x.dtype)
+        if self.pose_mode == "fit" and self.pose_calls % self.pose_every == 0:
+            self.pose_ref_ca = x[self.ca_pred_t].detach().double()   # the frame of the fit about to happen
+        return x
+
     def pose_moments(self, A, third):
         """Model moments under the current viewing density; in fit mode, theta is refitted by the exact QP every
         pose_every calls (moments are affine in theta and the loss is a quadratic form: writeup, Unknown pose density)."""
@@ -268,7 +295,7 @@ class OracleMomentReward(Reward):
 
         A = A.to(torch.complex64)
         withC = lambda m: dict(m, C=(self.pose_Binv @ m["c2"].reshape(m["c2"].shape[0], -1)).reshape(m["c2"].shape))
-        if self.pose_mode == "fit":
+        if self.pose_mode == "fit" and getattr(self, "_pose_live", False):   # only for guided structures
             if self.pose_calls % self.pose_every == 0:
                 with torch.no_grad():
                     basis = self.pose.basis_moments(A.detach(), self.pose_dens, third=third)
@@ -288,9 +315,16 @@ class OracleMomentReward(Reward):
         the reward's own). Returns (m12, m3 or None)."""
         space, third = space or self.space, (self.order >= 3 if third is None else third)
         x = x[self.keep]
+        live = getattr(self, "pose", None) is not None and space == "image"
+        if live:
+            x = self._pose_frame(x)
         A = self.inv.coefficients(x - x.mean(0), self.rho)
         if space == "image":
-            return self.img_losses(A, third)
+            self._pose_live = live
+            try:
+                return self.img_losses(A, third)
+            finally:
+                self._pose_live = False
         return self.m12(A, s), (self.m3(A, s) if third else None)
 
     def compute(self, sample, pdb_save_path=None):

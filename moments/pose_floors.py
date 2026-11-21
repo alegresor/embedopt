@@ -45,9 +45,21 @@ def fit_from_structure(a):
         J = lambda m: float(loss.m12(withC(m))) / n12 + float(loss.m3(m)) / n3
         th, info = fit_theta(basis, J, dens, collocation(400))
     th_true = dens.project(VMFMixture.default())
-    json.dump(th.tolist(), open(a.out, "w"))
-    print(f"theta from {a.model}: |theta - theta_true| / |theta_true| = "
-          f"{np.linalg.norm(th - th_true) / np.linalg.norm(th_true):.3f}, min nu {info['min_nu']:.3f} -> {a.out}")
+    json.dump(th.tolist(), open(a.out, "w"))     # theta in the frame of the given structure (use it with POSE_REF)
+    # diagnostic only: the same fit after rotating the structure onto x* (Kabsch on CA), comparable to theta_true
+    msg = ""
+    ca_s, ca_x = st.coord[st.atom_name == "CA"].astype(float), atoms.coord[atoms.atom_name == "CA"].astype(float)
+    if len(ca_s) == len(ca_x):
+        P, Q = ca_s - ca_s.mean(0), ca_x - ca_x.mean(0)
+        U, _, Vt = np.linalg.svd(P.T @ Q)
+        R = Vt.T @ np.diag([1, 1, np.sign(np.linalg.det(Vt.T @ U.T))]) @ U.T
+        st2 = st.copy()
+        st2.coord = ((st.coord - ca_s.mean(0)) @ R.T).astype(np.float32)
+        with torch.no_grad():
+            b2 = pm4.basis_moments(T(D.coef_of(G, st2)), dens)
+            th2, _ = fit_theta(b2, J, dens, collocation(400))
+        msg = f"; in x*'s frame |theta - theta_true| / |theta_true| = {np.linalg.norm(th2 - th_true) / np.linalg.norm(th_true):.3f}"
+    print(f"theta from {a.model}: min nu {info['min_nu']:.3f}{msg} -> {a.out}")
 
 
 def main():
