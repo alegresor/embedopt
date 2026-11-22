@@ -309,7 +309,7 @@ def combine(basis, theta):
             for key in basis[0]}
 
 
-def fit_theta(basis, loss, dens, colloc, theta0=None, ridge=0.0):
+def fit_theta(basis, loss, dens, colloc, theta0=None, ridge=0.0, ridge_rel=0.0):
     """Minimize loss(combine(basis, theta)) over theta, a convex quadratic, subject to nu_theta >= 0 at the
     collocation directions colloc (n_s, 3). loss: moments dict -> float (a quadratic form in the moments, e.g.
     m12 / m12_0 + m3 / m3_0). The Hessian and gradient are obtained exactly from (K+1)(K+2)/2 loss evaluations."""
@@ -327,7 +327,8 @@ def fit_theta(basis, loss, dens, colloc, theta0=None, ridge=0.0):
         H[i, i] = Jk[i] + Jm[i] - 2 * J0
         for j in range(i + 1, K):
             H[i, j] = H[j, i] = (ev(e[i] + e[j]) - Jk[i] - Jk[j] + J0)
-    H = (H + H.T) / 2 + ridge * np.eye(K)
+    H = (H + H.T) / 2
+    H = H + (ridge + ridge_rel * float(np.mean(np.diag(H)))) * np.eye(K)   # shrinks theta towards the uniform density
     Phi = dens.basis_values(colloc).T                                             # (n_s, K)
     obj = lambda th: J0 + g @ th + 0.5 * th @ H @ th
     jac = lambda th: g + H @ th
