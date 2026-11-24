@@ -1,3 +1,5 @@
+empiar/
+*_files.txt
 *.zip 
 *.tgz 
 out/
