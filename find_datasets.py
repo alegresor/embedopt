@@ -79,10 +79,12 @@ def empiar(i):
 def emdb(emd):
     j = get(f"https://www.ebi.ac.uk/emdb/api/entry/{emd}", emd) or {}
     res = [r for r in map(num, walk(j, "resolution")) if r]
-    text = json.dumps(j.get("sample", {})) + json.dumps(j.get("admin", {}).get("title", ""))
+    # Membrane markers live in admin.keywords, the sample, and the specimen buffer (detergents).
+    adm = j.get("admin", {})
+    text = json.dumps([adm.get("title", ""), adm.get("keywords", ""), j.get("sample", {}), list(walk(j, "buffer"))])
     return dict(emd=emd, method=",".join(sorted({str(m) for m in walk(j, "method")}))[:40],
                 resolution=min(res) if res else None,
-                symmetry=",".join(sorted({str(p) for p in walk(j, "point_group")})),
+                symmetry=",".join(sorted({str(p) for p in walk(j, "point_group")})) or "unreported",
                 membrane_flag=bool(MEMBRANE.search(text)),
                 pdb=sorted({str(p).upper() for p in walk(j, "pdb_id")}))
 
