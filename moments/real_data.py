@@ -148,6 +148,27 @@ def estimate(acc, ex, G, Sig, P, halves=(0, 1), alpha=None):
     return {k: v.cpu().numpy() for k, v in dict(a=a, c2=c2, c3=c3).items()}
 
 
+class Detrend:
+    """Least-squares plane mu + bx x + by y on the corner pixels (outside the inscribed circle), subtracted from the
+    whole image: removes background offsets and ice gradients, which otherwise leak into the corner spectrum through
+    the mask's transform and into the moments through the finite box."""
+
+    def __init__(self, L):
+        n = np.arange(L) - L / 2
+        y, x = np.meshgrid(n, n, indexing="ij")
+        self.m = ((x**2 + y**2) > (L / 2) ** 2).ravel()
+        self.A = np.stack([np.ones(L * L), x.ravel() / L, y.ravel() / L], 1)           # (L^2, 3)
+        self.pinv = np.linalg.pinv(self.A[self.m])                                    # (3, n_corner)
+        self.stats = np.zeros(3)                                                      # sum mu^2, sum |b|^2, n
+
+    def __call__(self, x):
+        B, L, _ = x.shape
+        f = x.reshape(B, -1)
+        c = f[:, self.m] @ self.pinv.T                                                # (B, 3)
+        self.stats += [(c[:, 0] ** 2).sum(), (c[:, 1:] ** 2).sum(), B]
+        return (f - c @ self.A.T).reshape(B, L, L)
+
+
 def origin_sign(G, meta, root, idx, fn, rows, n=3000):
     """Sign of the origins that best centres the particles: |sum_j H_j I_j0| on the shells, mid-weighted."""
     sel = rows[:n]
@@ -155,6 +176,7 @@ def origin_sign(G, meta, root, idx, fn, rows, n=3000):
     for sgn in (0.0, 1.0, -1.0):
         num = 0
         for r, x in batches(root, idx, fn, sel, 1024):
+            x = Detrend(x.shape[-1])(x)
             H = ctf_of(meta, r, G.kappa)
             sh = None if sgn == 0 else sgn * np.stack([meta["ox"][r], meta["oy"][r]], 1)
             num = num + (H * G.coeffs(x, sh)[:, :, 0]).sum(0)
@@ -191,9 +213,11 @@ def cmd_stack(a):
         sc = origin_sign(G, meta, a.root, idx, fn, rows)
         sgn = max((1.0, -1.0), key=sc.get)
         print(f"centering score (none / +origins / -origins): {sc[0.0]:.4g} / {sc[1.0]:.4g} / {sc[-1.0]:.4g}; using {sgn:+.0f}")
-    acc, ex, psd = Accumulator(G, 2, dev), Extra(G, dev), CornerPSD(meta["L"], meta["p"])
+    acc, ex, psd, det = Accumulator(G, 2, dev), Extra(G, dev), CornerPSD(meta["L"], meta["p"]), Detrend(meta["L"])
     t0, seen = time.time(), 0
     for r, x in batches(a.root, idx, fn, rows, a.batch):
+        if a.detrend:
+            x = det(x)
         H = ctf_of(meta, r, G.kappa)
         sh = None if sgn == 0 else sgn * np.stack([meta["ox"][r], meta["oy"][r]], 1)
         X = G.coeffs(x, sh) * H[:, :, None]                                   # X~ = H I
@@ -204,11 +228,15 @@ def cmd_stack(a):
             el = time.time() - t0
             print(f"  {seen}/{len(rows)} ({el / 60:.1f} min, ~{el * (len(rows) / seen - 1) / 60:.0f} min left)", flush=True)
     S = psd.spectrum()
+    if a.detrend:
+        mu2, b2, nn = det.stats
+        print(f"removed background: rms offset {np.sqrt(mu2 / nn):.3f}, rms gradient {np.sqrt(b2 / nn / 2):.3f} per box; "
+              f"corner noise variance after detrending {S.mean():.3f}")
     SigF, P = noise_cov_psd(G, S, G.L, G.Q3, dev)
     Sig = SigF[G.L:]                                                          # q = 0..L
     full, h0, h1 = estimate(acc, ex, G, Sig, P), estimate(acc, ex, G, Sig, P, (0,)), estimate(acc, ex, G, Sig, P, (1,))
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    np.savez(a.out, **full, kappa=G.kappa, nb3=G.nb3, Q3=G.Q3, L=G.L, shells3=G.shells3, n_images=len(rows), ctf=a.ctf,
+    np.savez(a.out, **full, kappa=G.kappa, nb3=G.nb3, Q3=G.Q3, L=G.L, shells3=G.shells3, n_images=len(rows), ctf=a.ctf, detrend=a.detrend, psd_profile=S[0, : meta["L"] // 2],
              r_max=G.r_max, L_img=meta["L"], pixel=meta["p"], center=a.center, origin_sign=sgn, system=a.system,
              noise_var=float(S.mean()), **{f"h0_{k}": v for k, v in h0.items()}, **{f"h1_{k}": v for k, v in h1.items()},
              Sig=Sig, P=P, **{f"sum_{k}": getattr(acc, k).cpu().numpy() for k in ("s1", "s2", "s3")},
@@ -411,6 +439,7 @@ def main():
     s.add_argument("--star", required=True); s.add_argument("--root", required=True); s.add_argument("--system", required=True)
     s.add_argument("--center", choices=("none", "origins"), default="none")
     s.add_argument("--ctf", choices=("avg", "mean"), default="avg", help="radial CTF: in-plane average (default) or mean defocus")
+    s.add_argument("--no-detrend", dest="detrend", action="store_false", help="keep the per-image background plane")
     s.add_argument("--n", type=int, default=0, help="random subset of particles (0 = all)")
     s.add_argument("--seed", type=int, default=0); s.add_argument("--batch", type=int, default=512)
     s.add_argument("--nb3", type=int, default=8); s.add_argument("--q3", type=int, default=16)
