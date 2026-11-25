@@ -223,11 +223,20 @@ def fit_scale(a_d, a_m, kappa, sl):
     return best[0], best[1]
 
 
-def normalize(m, s, dB, kappa, sh3):
-    e = np.exp(-dB * kappa**2 / 4)
+def shell_envelope(d, m, sign):
+    """Free per-shell envelope from the power: e_k^2 = sum_q c2d_q(k,k) / sum_q c2m_q(k,k) (Wilson-plot scaling);
+    sign from the first moment's lowest shell. Returns signed e (NK,) with e = s E(kappa)."""
+    pd = np.einsum("qkk->k", d["c2"]).real
+    pm = np.einsum("qkk->k", m["c2"]).real
+    return sign * np.sqrt(np.maximum(pd, 0) / pm)
+
+
+def normalize(m, s, dB, kappa, sh3, e=None):
+    """Divide out s E(kappa): E = exp(-dB k^2 / 4) with scale s, or a given signed per-shell e (then s, dB unused)."""
+    e = s * np.exp(-dB * kappa**2 / 4) if e is None else e
     es = e[sh3]
-    return dict(a=m["a"] / (s * e), c2=m["c2"] / (s**2 * e[:, None] * e[None]),
-                c3=m["c3"] / (s**3 * es[:, None, None] * es[None, :, None] * es[None, None]))
+    return dict(a=m["a"] / e, c2=m["c2"] / (e[:, None] * e[None]),
+                c3=m["c3"] / (es[:, None, None] * es[None, :, None] * es[None, None]))
 
 
 def losses(ref, test, dev):
@@ -263,10 +272,17 @@ def cmd_compare(a):
         m, im, _ = model_moments(G, at, dev)
         m = {k: v.detach().cpu().numpy() for k, v in m.items() if k in ("a", "c2", "c3")}  # x* or --model
         s, dB = fit_scale(data["a"], m["a"], K, sl)
-        dn, hn = normalize(data, s, dB, K, sh3), [normalize(h, s, dB, K, sh3) for h in halves]
+        e = None
+        if a.envelope == "shell":
+            e = shell_envelope(data, m, np.sign((data["a"][0] / m["a"][0]).real))
+            s = e[0]
+            Bk = -2 * np.log(np.abs(e[1:] / e[0])) / (K[1:] ** 2 - K[0] ** 2)             # implied B per shell
+            print(f"   per-shell envelope e(k) / e(k1): " + " ".join(f"{v:.2f}" for v in np.abs(e / e[0])))
+            print(f"   implied B (A^2) from shell 1 to k: " + " ".join(f"{v:.0f}" for v in Bk))
+        dn, hn = normalize(data, s, dB, K, sh3, e), [normalize(h, s, dB, K, sh3, e) for h in halves]
         L_dm = losses(m, dn, dev)
         L_hh = losses(m, {k: m[k] + hn[0][k] - hn[1][k] for k in m}, dev)      # |h0 - h1|^2 / |model|^2
-        print(f"\n== {name}: s = {s:+.4g}, dB = {dB:.0f} A^2")
+        print(f"\n== {name}: " + (f"s = {s:+.4g}, dB = {dB:.0f} A^2" if e is None else "per-shell (Wilson) envelope"))
         print("   losses data vs model: " + "  ".join(f"{k} {v:.3e}" for k, v in L_dm.items()))
         print("   half vs half / 4 (sampling floor of the full data): "
               + "  ".join(f"{k} {v / 4:.3e}" for k, v in L_hh.items()))
@@ -283,8 +299,8 @@ def cmd_compare(a):
                 n3 = rel(hn[0]["c3"][..., j, j, j], hn[1]["c3"][..., j, j, j]) / 2
                 line += f"          {e3:>10.3f} ({n3:.3f})"
             print(line)
-        out = a.data.replace(".npz", f"_norm_{a.system}.npz")
-        np.savez(out, **{**D, **dn}, fit_s=s, fit_dB=dB)
+        out = a.data.replace(".npz", f"_norm_{a.system}_{a.envelope}.npz")
+        np.savez(out, **{**D, **dn}, fit_s=s, fit_dB=dB, envelope=a.envelope, **({} if e is None else dict(fit_e=e)))
         print(f"   normalized data (with x*'s s, dB; usable as DATA=) -> {out}")
 
 
@@ -359,6 +375,8 @@ def main():
     c.add_argument("--data", required=True); c.add_argument("--system", required=True)
     c.add_argument("--model", nargs="*", default=[]); c.add_argument("--fit-from", type=int, default=0,
                                                                      help="first shell index used in the (s, dB) fit")
+    c.add_argument("--envelope", choices=("gauss", "shell"), default="shell",
+                   help="shell: free per-shell envelope from the c2 power (default); gauss: s exp(-dB k^2/4) fitted to a")
     t = sp.add_parser("selftest")
     t.add_argument("--system", default="7N6N"); t.add_argument("--n", type=int, default=4000)
     t.add_argument("--box", type=int, default=128); t.add_argument("--pixel", type=float, default=1.2)
