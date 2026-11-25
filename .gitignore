@@ -1,3 +1,5 @@
+*.cif
+*.fasta
 *.star
 *.mrcs 
 stars/*.txt
