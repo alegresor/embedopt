@@ -20,3 +20,6 @@ q.to_csv(here / "10810_particles_present.csv", index=False)
 
 bad = [x for x in f[ok].unique() if (root/x).stat().st_size < 1024 + nz(x)*226*226*4]
 print(len(bad), "truncated")
+
+for x in bad: (root / x).unlink()
+print("deleted", len(bad))
