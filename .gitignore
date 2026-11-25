@@ -1,4 +1,6 @@
-stars/ 
+*.star
+*.mrcs 
+stars/*.txt
 empiar/
 *_files.txt
 *.zip 
