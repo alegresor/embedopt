@@ -125,12 +125,16 @@ class Extra:
             self.T[h] += torch.einsum("ba,bd,bc->adc", Xs, Hc, Hc)
 
 
-def estimate(acc, ex, G, Sig, P, halves=(0, 1)):
-    """Moments from the sums of the given halves (Sig: (L+1, NK, NK) q = 0..L; P: (2 Q3 + 1, S, S) q = -Q3..Q3)."""
+def estimate(acc, ex, G, Sig, P, halves=(0, 1), alpha=None):
+    """Moments from the sums of the given halves (Sig: (L+1, NK, NK) q = 0..L; P: (2 Q3 + 1, S, S) q = -Q3..Q3).
+    alpha (NK,): per-shell noise calibration, Sig(k1,k2) and P(b,c) scaled by sqrt(alpha alpha)."""
     h = list(halves)
     dev = ex.dev
     s1, s2, s3 = (x[h].sum(0) for x in (acc.s1, acc.s2, acc.s3))
     d1, d2, w2, d3, T = (x[h].sum(0) for x in (ex.d1, ex.d2, ex.w2, ex.d3, ex.T))
+    if alpha is not None:
+        r = np.sqrt(np.outer(alpha, alpha))
+        Sig, P = Sig * r[None], P * r[np.ix_(G.shells3, G.shells3)][None]
     Sig, P = torch.as_tensor(Sig, device=dev), torch.as_tensor(P, device=dev)
     a = s1 / d1
     c2 = (s2 - Sig * w2[None]) / d2[None]
@@ -206,11 +210,47 @@ def cmd_stack(a):
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
     np.savez(a.out, **full, kappa=G.kappa, nb3=G.nb3, Q3=G.Q3, L=G.L, shells3=G.shells3, n_images=len(rows), ctf=a.ctf,
              r_max=G.r_max, L_img=meta["L"], pixel=meta["p"], center=a.center, origin_sign=sgn, system=a.system,
-             noise_var=float(S.mean()), **{f"h0_{k}": v for k, v in h0.items()}, **{f"h1_{k}": v for k, v in h1.items()})
+             noise_var=float(S.mean()), **{f"h0_{k}": v for k, v in h0.items()}, **{f"h1_{k}": v for k, v in h1.items()},
+             Sig=Sig, P=P, **{f"sum_{k}": getattr(acc, k).cpu().numpy() for k in ("s1", "s2", "s3")},
+             **{f"sum_{k}": getattr(ex, k).cpu().numpy() for k in ("d1", "d2", "w2", "d3", "T")})
     print(f"wrote {a.out} ({(time.time() - t0) / 60:.1f} min; corner noise variance {S.mean():.3f})")
 
 
 # ------------------------------------------------------------------------------------------------ comparison
+class _Sums:
+    def __init__(self, D, keys, dev):
+        for k in keys:
+            setattr(self, k, torch.as_tensor(D[f"sum_{k}"], device=dev))
+        self.dev = dev
+
+
+def recalibrate(D, G, atoms, dev, margin):
+    """Per-shell noise scale alpha_k from in-plane orders beyond the particle's bandlimit, q > 2 pi k r_p + margin,
+    where the raw sums S2_q(k,k) are noise only; then re-estimate with Sig, P scaled by sqrt(alpha alpha)."""
+    X = np.asarray(atoms.coord, float)
+    rp = np.linalg.norm(X - X.mean(0), axis=1).max()
+    acc, ex = _Sums(D, ("s1", "s2", "s3"), dev), _Sums(D, ("d1", "d2", "w2", "d3", "T"), dev)
+    S2 = D["sum_s2"].sum(0)                                                    # (L+1, NK, NK), both halves
+    B2 = D["Sig"] * D["sum_w2"].sum(0)[None]
+    qv, K = np.arange(S2.shape[0]), G.kappa
+    alpha, snr = np.full(len(K), np.nan), np.full(len(K), np.nan)
+    print(f"   noise calibration from signal-free orders (r_p = {rp:.1f} A, margin {margin}):")
+    print("   shell  q_s  #q   alpha    signal/noise power (calibrated)")
+    for k in range(len(K)):
+        qs = int(np.ceil(2 * np.pi * K[k] * rp)) + margin
+        free = qv > qs
+        if free.sum() >= 3:
+            alpha[k] = S2[free, k, k].real.sum() / B2[free, k, k].real.sum()
+        sig = (S2[:, k, k].real - alpha[k] * B2[:, k, k].real).sum()
+        snr[k] = sig / (alpha[k] * B2[:, k, k].real.sum())
+        print(f"   {k + 1:>5}  {qs:>3}  {int(free.sum()):>3}  {alpha[k]:.4f}   {snr[k]:+.2e}")
+    if np.isnan(alpha).any():                                                  # shells without free orders: neighbour
+        good = ~np.isnan(alpha)
+        alpha = np.interp(np.arange(len(K)), np.flatnonzero(good), alpha[good])
+    est = lambda h: estimate(acc, ex, G, D["Sig"], D["P"], h, alpha)
+    return est((0, 1)), [est((0,)), est((1,))]
+
+
 def fit_scale(a_d, a_m, kappa, sl):
     """(s, dB) minimizing sum_k |a_d - s exp(-dB k^2 / 4) a_m|^2 over shells sl: dB on a grid, s in closed form."""
     best = None
@@ -228,7 +268,10 @@ def shell_envelope(d, m, sign):
     sign from the first moment's lowest shell. Returns signed e (NK,) with e = s E(kappa)."""
     pd = np.einsum("qkk->k", d["c2"]).real
     pm = np.einsum("qkk->k", m["c2"]).real
-    return sign * np.sqrt(np.maximum(pd, 0) / pm)
+    if (pd <= 0).any():
+        print(f"   WARNING: non-positive data power in shells {list(np.flatnonzero(pd <= 0) + 1)} (noise over-subtracted); "
+              f"envelope set to NaN there")
+    return sign * np.sqrt(np.where(pd > 0, pd, np.nan) / pm)
 
 
 def normalize(m, s, dB, kappa, sh3, e=None):
@@ -266,6 +309,8 @@ def cmd_compare(a):
     sl = slice(a.fit_from, None)
     data = {k: D[k] for k in ("a", "c2", "c3")}
     halves = [{k: D[f"h{i}_{k}"] for k in ("a", "c2", "c3")} for i in (0, 1)]
+    if "sum_s2" in D and not a.no_calib:
+        data, halves = recalibrate(D, G, atoms, dev, a.rp_margin)
     models = [("x*", atoms)] + [(os.path.basename(p), structure_atoms(p)) for p in a.model]
     print(f"{a.data}: {int(D['n_images'])} images, center={D['center']}; fit (s, dB) on shells {a.fit_from + 1}..{len(K)}")
     for name, at in models:
@@ -274,7 +319,7 @@ def cmd_compare(a):
         s, dB = fit_scale(data["a"], m["a"], K, sl)
         e = None
         if a.envelope == "shell":
-            e = shell_envelope(data, m, np.sign((data["a"][0] / m["a"][0]).real))
+            e = shell_envelope(data, m, np.sign((data["a"][0] / m["a"][0]).real) or 1.0)
             s = e[0]
             Bk = -2 * np.log(np.abs(e[1:] / e[0])) / (K[1:] ** 2 - K[0] ** 2)             # implied B per shell
             print(f"   per-shell envelope e(k) / e(k1): " + " ".join(f"{v:.2f}" for v in np.abs(e / e[0])))
@@ -375,6 +420,8 @@ def main():
     c.add_argument("--data", required=True); c.add_argument("--system", required=True)
     c.add_argument("--model", nargs="*", default=[]); c.add_argument("--fit-from", type=int, default=0,
                                                                      help="first shell index used in the (s, dB) fit")
+    c.add_argument("--no-calib", action="store_true", help="use the corner noise estimate as is")
+    c.add_argument("--rp-margin", type=int, default=6, help="orders beyond 2 pi k r_p treated as signal")
     c.add_argument("--envelope", choices=("gauss", "shell"), default="shell",
                    help="shell: free per-shell envelope from the c2 power (default); gauss: s exp(-dB k^2/4) fitted to a")
     t = sp.add_parser("selftest")
