@@ -76,11 +76,22 @@ json.dump([{"name": f"{ID}_minimal", "sequences": chains}],
           open(B / "json_minimal" / f"{ID}_minimal.json", "w"), indent=2)
 cfg = json.load(open(B / "stage3a_cfgs" / "8AHU_A_benchmark.json"))[0]
 cfg["name"] = f"{ID}_embedopt_0.1_5A"
+def a3m_query(p):
+    """First sequence of an a3m (the query), insertions (lowercase) removed."""
+    lines = Path(p).read_text().splitlines()
+    i = next(k for k, l in enumerate(lines) if l.startswith(">"))
+    return "".join(c for c in lines[i + 1].strip() if not c.islower())
+
+# Pick, for each sequence, the MSA directory whose query equals it (the server's numbering of msa/<k> need not
+# follow the input order).
+dirs = sorted((B / "msa" / f"{ID}_minimal" / "msa").glob("*/non_pairing.a3m"))
 missing = []
 for k, c in enumerate(chains):
-    d = B / "msa" / f"{ID}_minimal" / "msa" / str(k)
-    if (d / "non_pairing.a3m").exists():
+    hit = [d.parent for d in dirs if a3m_query(d) == c["proteinChain"]["sequence"]]
+    if hit:
+        d = hit[0]
         c["proteinChain"].update(pairedMsaPath=str(d / "pairing.a3m"), unpairedMsaPath=str(d / "non_pairing.a3m"))
+        print(f"sequence {k} ({len(c['proteinChain']['sequence'])} aa): MSA {d.relative_to(B)}")
     else:
         missing.append(k)
 cfg["sequences"] = chains
@@ -88,4 +99,5 @@ cfg["reward"]["params"].update(ref_pdb_path=str(B / "pdb_clean" / f"{ID}.pdb"),
                                ref_map_path=str(B / "synthetic_maps" / "5.0A" / f"{ID}.map"))
 json.dump([cfg], open(B / "stage3a_cfgs" / f"{ID}_benchmark.json", "w"), indent=2)
 print(f"wrote {ID}_minimal.json and {ID}_benchmark.json; tokens = {sum(len(g['seq']) * len(g['chains']) for g in groups)}")
-if missing: print(f"no MSA yet for sequence(s) {missing}: run `protenix msa` and rerun this script")
+if missing: print(f"no MSA whose query matches sequence(s) {missing}: run `protenix msa` (or check "
+                  f"{B.name}/msa/{ID}_minimal/msa/*/non_pairing.a3m) and rerun this script")
