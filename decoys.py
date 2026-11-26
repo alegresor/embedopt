@@ -114,4 +114,31 @@ if a.pred:
             print(f"    chain {c}: {len(seg)} of {m.sum()} residues deviate > 2 A"
                   + (f"; first/last such residue {seg[0][0]}..{seg[-1][0]}" if seg else ""))
     else:
-        print(f"  prediction has {len(pc)} CA vs {len(xc)} in x*: lengths differ, RMSD skipped")
+        # different chain layouts: match CA of the first two chains of each by residue number
+        cx, cp = list(dict.fromkeys(xc.chain_id))[:2], list(dict.fromkeys(pc.chain_id))[:2]
+        sel_x, sel_p = [], []
+        for a_, b_ in zip(cx, cp):
+            ix = {int(r): i for i, (c, r) in enumerate(zip(xc.chain_id, xc.res_id)) if c == a_}
+            ip = {int(r): i for i, (c, r) in enumerate(zip(pc.chain_id, pc.res_id)) if c == b_}
+            common = sorted(set(ix) & set(ip))
+            sel_x += [ix[r] for r in common]; sel_p += [ip[r] for r in common]
+        if len(sel_x) < 10:
+            print(f"  prediction has {len(pc)} CA vs {len(xc)} in x* and too few residues in common: RMSD skipped")
+        else:
+            X1, P1 = xc[np.array(sel_x)], pc[np.array(sel_p)]
+            fit = fitted(X1, P1)
+            print(f"  prediction vs x* on {len(sel_x)} CA matched by residue number in chains {cp} / {cx}: "
+                  f"RMSD after superposition {bs.rmsd(X1, fit):.2f} A")
+            for a_, b_ in zip(cx, cp):
+                mx = X1.chain_id == a_
+                if mx.sum() >= 3:
+                    fc = fitted(X1[mx], P1[mx])
+                    print(f"    chain {b_} vs {a_}: {mx.sum()} CA, RMSD {bs.rmsd(X1[mx], fc):.2f} A")
+            if len(cx) == 2:
+                mA, mB = X1.chain_id == cx[0], X1.chain_id == cx[1]
+                T = bs.superimpose(X1[mA], P1[mA]); T = T[1] if isinstance(T, tuple) else T
+                pB = T.apply(P1[mB])
+                TB = bs.superimpose(X1[mB], pB); TB = TB[1] if isinstance(TB, tuple) else TB
+                R = np.asarray(TB.rotation).reshape(3, 3)
+                ang = np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1)))
+                print(f"    second chain relative to first (after superposing the first): rigid rotation {ang:.1f} deg")
