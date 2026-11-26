@@ -103,6 +103,59 @@ def batches(root, idx, fn, rows, batch):
         yield np.concatenate(buf_r), np.concatenate(buf_x)
 
 
+# ------------------------------------------------------------------------------------------------ mask
+def soft_disk(L, p, r0, r1):
+    """1 for r < r0, raised cosine to 0 at r1 (A), on the L x L pixel grid centred at L/2 ([y, x])."""
+    n = (np.arange(L) - L / 2) * p
+    r = np.hypot(n[:, None], n[None])
+    return np.where(r < r0, 1.0, np.where(r < r1, 0.5 * (1 + np.cos(np.pi * (r - r0) / (r1 - r0))), 0.0))
+
+
+def noise_cov_psd_masked(G, S, qmax2, Q3m, dev="cpu", mask=None):
+    """moments.ctf2d.noise_cov_psd for noise multiplied by a real-space mask w before the polar transform: the
+    coefficients of w N are those of N for the kernel Phi^w = IDFT(w * DFT(Phi)) (Phi_q(k) = sum_n a_q(n) e^{2 pi i k n/L}
+    with a_q the pixel-space analysis function), so Sigma, P follow exactly from the same quadratic forms."""
+    L, p, s, nphi = G.L_img, G.p, G.s, G.nphi
+    phi = torch.as_tensor(2 * np.pi * np.arange(nphi) / nphi, dtype=torch.float64, device=dev)
+    kk = torch.arange(L, dtype=torch.float64, device=dev)
+    n = torch.arange(L, dtype=torch.float64, device=dev)
+    W = None if mask is None else torch.as_tensor(mask, dtype=torch.float64, device=dev)
+
+    def g(u):
+        th = 2 * np.pi * (kk[None, :, None] * n[None, None, :] / L - u[:, None, None] * (n[None, None, :] - L / 2) * p)
+        return torch.exp(1j * th).sum(-1)
+
+    qs = np.arange(-qmax2, qmax2 + 1)
+    St = torch.as_tensor(S, dtype=torch.float64, device=dev).reshape(-1)
+    gxy = [(g(kap * torch.cos(phi)), g(kap * torch.sin(phi))) for kap in G.kappa]
+    neg = ((-torch.arange(L, device=dev)) % L)
+    negflat = (neg[:, None] * L + neg[None, :]).reshape(-1)
+    c = s**2 / L**2
+    NK = len(G.kappa)
+    Sig = torch.zeros(len(qs), NK, NK, dtype=torch.complex128, device=dev)
+    q3 = np.arange(-Q3m, Q3m + 1)
+    P = torch.zeros(len(q3), len(G.shells3), len(G.shells3), dtype=torch.complex128, device=dev)
+    shells3 = list(G.shells3)
+
+    def phis(qv):
+        E = torch.exp(-1j * torch.as_tensor(qv, dtype=torch.float64, device=dev)[:, None] * phi[None]) / nphi
+        F = torch.stack([torch.einsum("qp,py,px->qyx", E, gy, gx) for gx, gy in gxy])          # (NK, q, L, L)
+        if W is not None:
+            F = torch.fft.ifft2(W * torch.fft.fft2(F))
+        return F.reshape(NK, len(qv), -1)
+
+    for i0 in range(0, len(qs), 16):
+        qv = qs[i0:i0 + 16]
+        F = phis(qv)
+        Sig[i0:i0 + len(qv)] = c * torch.einsum("iqk,jqk->qij", F * St, F.conj())
+    for i0 in range(0, len(q3), 16):
+        qv = q3[i0:i0 + 16]
+        Fs = phis(qv)[shells3]
+        Fm = phis(-qv)[shells3][:, :, negflat]
+        P[i0:i0 + len(qv)] = c * torch.einsum("iqk,jqk->qij", Fs * St, Fm)
+    return Sig.cpu().numpy(), P.cpu().numpy()
+
+
 # ------------------------------------------------------------------------------------------------ accumulation
 class Extra:
     """CTF sums per half: sum H^2, sum H^2 H^2, sum H H (noise bias of c2), sum H^2 H^2 H^2 and T on third shells."""
@@ -217,6 +270,9 @@ def cmd_stack(a):
         sgn = max((1.0, -1.0), key=sc.get)
         print(f"centering score (none / +origins / -origins): {sc[0.0]:.4g} / {sc[1.0]:.4g} / {sc[-1.0]:.4g}; using {sgn:+.0f}")
     acc, ex, psd, det = Accumulator(G, 2, dev), Extra(G, dev), CornerPSD(meta["L"], meta["p"]), Detrend(meta["L"])
+    wmask = soft_disk(meta["L"], meta["p"], *a.mask) if a.mask else None
+    if wmask is not None:
+        print(f"soft circular mask: 1 for r < {a.mask[0]} A, raised cosine to 0 at {a.mask[1]} A")
     t0, seen, ref_std, bad, nrej = time.time(), 0, None, [], {}
     for r, x in batches(a.root, idx, fn, rows, a.batch):
         # screen: non-finite pixels, or corner std off by > a.screen x the median of the first batch
@@ -240,11 +296,14 @@ def cmd_stack(a):
             continue
         if a.detrend:
             x = det(x)
+        psd.add(x)                                                           # corners: before the mask
+        if wmask is not None:
+            x = x * wmask
         H = ctf_of(meta, r, G.kappa)
         sh = None if sgn == 0 else sgn * np.stack([meta["ox"][r], meta["oy"][r]], 1)
         X = G.coeffs(x, sh) * H[:, :, None]                                   # X~ = H I
         hr = (r % 2).astype(int)
-        acc.add(X, hr); ex.add(H, X[:, :, 0], hr); psd.add(x)
+        acc.add(X, hr); ex.add(H, X[:, :, 0], hr)
         seen += len(r)
         if seen // a.log_every != (seen - len(r)) // a.log_every:
             el = time.time() - t0
@@ -261,11 +320,12 @@ def cmd_stack(a):
         mu2, b2, nn = det.stats
         print(f"removed background: rms offset {np.sqrt(mu2 / nn):.3f}, rms gradient {np.sqrt(b2 / nn / 2):.3f} per box; "
               f"corner noise variance after detrending {S.mean():.3f}")
-    SigF, P = noise_cov_psd(G, S, G.L, G.Q3, dev)
+    SigF, P = noise_cov_psd_masked(G, S, G.L, G.Q3, dev, wmask)
     Sig = SigF[G.L:]                                                          # q = 0..L
     full, h0, h1 = estimate(acc, ex, G, Sig, P), estimate(acc, ex, G, Sig, P, (0,)), estimate(acc, ex, G, Sig, P, (1,))
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    np.savez(a.out, **full, kappa=G.kappa, nb3=G.nb3, Q3=G.Q3, L=G.L, shells3=G.shells3, n_images=len(rows) - len(bad), n_rejected=len(bad), ctf=a.ctf, detrend=a.detrend, psd_profile=S[0, : meta["L"] // 2],
+    np.savez(a.out, **full, kappa=G.kappa, nb3=G.nb3, Q3=G.Q3, L=G.L, shells3=G.shells3, n_images=len(rows) - len(bad), n_rejected=len(bad), mask_r0=a.mask[0] if a.mask else 0.0,
+             mask_r1=a.mask[1] if a.mask else 0.0, ctf=a.ctf, detrend=a.detrend, psd_profile=S[0, : meta["L"] // 2],
              r_max=G.r_max, L_img=meta["L"], pixel=meta["p"], center=a.center, origin_sign=sgn, system=a.system,
              noise_var=float(S.mean()), **{f"h0_{k}": v for k, v in h0.items()}, **{f"h1_{k}": v for k, v in h1.items()},
              Sig=Sig, P=P, **{f"sum_{k}": getattr(acc, k).cpu().numpy() for k in ("s1", "s2", "s3")},
@@ -281,12 +341,21 @@ class _Sums:
         self.dev = dev
 
 
-def recalibrate(D, G, atoms, dev, margin):
+def recalibrate(D, G, atoms, dev, margin, alpha_from=None):
     """Per-shell noise scale alpha_k from in-plane orders beyond the particle's bandlimit, q > 2 pi k r_p + margin,
     where the raw sums S2_q(k,k) are noise only; then re-estimate with Sig, P scaled by sqrt(alpha alpha)."""
     X = np.asarray(atoms.coord, float)
     rp = np.linalg.norm(X - X.mean(0), axis=1).max()
+    if float(D.get("mask_r1", 0)) > 0:                       # masked: anything inside the mask may carry signal
+        rp = float(D["mask_r1"])
     acc, ex = _Sums(D, ("s1", "s2", "s3"), dev), _Sums(D, ("d1", "d2", "w2", "d3", "T"), dev)
+    if alpha_from is not None:                     # masked data: noise is band-limited in q too; reuse alpha
+        alpha = alpha_from
+        print("   noise calibration: alpha taken from the unmasked data: " + " ".join(f"{v:.3f}" for v in alpha))
+        est = lambda h: estimate(acc, ex, G, D["Sig"], D["P"], h, alpha)
+        return est((0, 1)), [est((0,)), est((1,))]
+    if float(D.get("mask_r1", 0)) > 0:
+        raise SystemExit("masked data: pass --alpha-from <unmasked .npz of the same particles> (or --no-calib)")
     S2 = D["sum_s2"].sum(0)                                                    # (L+1, NK, NK), both halves
     B2 = D["Sig"] * D["sum_w2"].sum(0)[None]
     qv, K = np.arange(S2.shape[0]), G.kappa
@@ -306,6 +375,22 @@ def recalibrate(D, G, atoms, dev, margin):
         alpha = np.interp(np.arange(len(K)), np.flatnonzero(good), alpha[good])
     est = lambda h: estimate(acc, ex, G, D["Sig"], D["P"], h, alpha)
     return est((0, 1)), [est((0,)), est((1,))]
+
+
+def alpha_of(path, G, atoms, dev, margin):
+    """alpha_k of an unmasked stack (for masked stacks of the same particles)."""
+    D = dict(np.load(path))
+    X = np.asarray(atoms.coord, float)
+    rp = np.linalg.norm(X - X.mean(0), axis=1).max()
+    S2, B2 = D["sum_s2"].sum(0), D["Sig"] * D["sum_w2"].sum(0)[None]
+    qv, K = np.arange(S2.shape[0]), G.kappa
+    al = np.full(len(K), np.nan)
+    for k in range(len(K)):
+        free = qv > int(np.ceil(2 * np.pi * K[k] * rp)) + margin
+        if free.sum() >= 3:
+            al[k] = S2[free, k, k].real.sum() / B2[free, k, k].real.sum()
+    good = ~np.isnan(al)
+    return np.interp(np.arange(len(K)), np.flatnonzero(good), al[good])
 
 
 def fit_scale(a_d, a_m, kappa, sl):
@@ -489,7 +574,11 @@ def cmd_compare(a):
     data = {k: D[k] for k in ("a", "c2", "c3")}
     halves = [{k: D[f"h{i}_{k}"] for k in ("a", "c2", "c3")} for i in (0, 1)]
     if "sum_s2" in D and not a.no_calib:
-        data, halves = recalibrate(D, G, atoms, dev, a.rp_margin)
+        af = alpha_of(a.alpha_from, G, atoms, dev, a.rp_margin) if a.alpha_from else None
+        data, halves = recalibrate(D, G, atoms, dev, a.rp_margin, af)
+    if a.eval_half is not None:
+        data = halves[a.eval_half]
+        print(f"   evaluating against half {a.eval_half} only ({int(D['n_images']) // 2} particles)")
     models = [("x*", atoms)] + [(os.path.basename(p), structure_atoms(p)) for p in a.model]
     if "Sig" in D:
         Sg = np.abs(D["Sig"]).max(0)
@@ -588,17 +677,21 @@ def cmd_export(a):
     D = dict(np.load(a.data))
     atoms = load_xstar(a.system)
     G = PolarGrid(atoms, int(D["L_img"]), float(D["pixel"]), nb3=int(D["nb3"]), Q3=int(D["Q3"]))
-    data, halves = recalibrate(D, G, atoms, dev, a.rp_margin)
+    af = alpha_of(a.alpha_from, G, atoms, dev, a.rp_margin) if a.alpha_from else None
+    data, halves = recalibrate(D, G, atoms, dev, a.rp_margin, af)
+    if a.use_half is not None:
+        data = halves[a.use_half]
     M2b, _ = biasfree_masks(G, a.dmin)
     keep3 = biasfree_masks(G, a.dmin)[1][:, :, 0, 0, 0]
     h2 = pair_corr(halves[0]["c2"], halves[1]["c2"], 0)
     h3 = pair_corr(halves[0]["c3"][keep3], halves[1]["c3"][keep3], 0)
     M2, M3t = M2b[0] & (h2 > a.min_repro), h3 > a.min_repro
-    out = a.out or a.data.replace(".npz", "_corr.npz")
+    out = a.out or a.data.replace(".npz", "_corr.npz" if a.use_half is None else f"_corr_h{a.use_half}.npz")
     np.savez(out, **data, kappa=D["kappa"], nb3=D["nb3"], Q3=D["Q3"], L=D["L"], shells3=D["shells3"],
              M2=M2, M3t=M3t, sign3=float(a.sign3), dmin=a.dmin, min_repro=a.min_repro, n_images=D["n_images"],
              source=a.data)
-    print(f"wrote {out}: {int(M2.sum())} c2 pairs, {int(M3t.sum())} of {M3t.size} c3 triples, sign3 {a.sign3:+.0f}")
+    print(f"wrote {out}: {int(M2.sum())} c2 pairs, {int(M3t.sum())} of {M3t.size} c3 triples, sign3 {a.sign3:+.0f}"
+          + ("" if a.use_half is None else f", half {a.use_half} only"))
 
 
 # ------------------------------------------------------------------------------------------------ self-test
@@ -655,6 +748,25 @@ def cmd_selftest(a):
           + "  ".join(f"{k} {rel(cor[k], truth[k]):.2e} / {rel(unc[k], truth[k]):.2e}" for k in ("a", "c2", "c3")),
           "(expect corrected << uncorrected for c2, c3; a has no bias)")
 
+    # 4. masked noise covariance: identical to ctf2d.noise_cov_psd without a mask; with a mask, removes the bias of
+    #    masked white noise
+    S0, P0 = noise_cov_psd_masked(G, S, G.L, G.Q3, dev, None)
+    print(f"4. noise_cov_psd_masked(mask=None) vs ctf2d.noise_cov_psd: rel diff Sigma {rel(S0, SigF):.1e}, P {rel(P0, P):.1e}"
+          " (expect ~1e-15)")
+    w = soft_disk(a.box, a.pixel, 0.35 * a.box * a.pixel, 0.48 * a.box * a.pixel)
+    SwF, Pw = noise_cov_psd_masked(G, S, G.L, G.Q3, dev, w)
+    accm, exm = Accumulator(G, 2, dev), Extra(G, dev)
+    for i in range(0, n, 256):
+        r = np.arange(i, min(i + 256, n))
+        H = ctf_of(meta, r, G.kappa)
+        X = G.coeffs(imgs[r] * w) * H[:, :, None]
+        accm.add(X, r % 2); exm.add(H, X[:, :, 0], r % 2)
+    corm, uncm = estimate(accm, exm, G, SwF[G.L:], Pw), estimate(accm, exm, G, 0 * SwF[G.L:], 0 * Pw)
+    wrong = estimate(accm, exm, G, Sig, P)
+    print(f"5. masked white noise, |c2|: masked covariance / none / unmasked covariance = "
+          f"{np.linalg.norm(corm['c2']) / np.linalg.norm(uncm['c2']):.2e} / 1 / "
+          f"{np.linalg.norm(wrong['c2']) / np.linalg.norm(uncm['c2']):.2e} (expect ~n^-1/2 / 1 / much larger)")
+
 
 def main():
     ap = argparse.ArgumentParser()
@@ -666,6 +778,8 @@ def main():
     s.add_argument("--no-detrend", dest="detrend", action="store_false", help="keep the per-image background plane")
     s.add_argument("--screen", type=float, default=10.0, help="reject images whose corner or full std is off by this factor")
     s.add_argument("--max-sigma", type=float, default=30.0, help="reject images with a pixel beyond this many reference stds")
+    s.add_argument("--mask", type=float, nargs=2, default=None, metavar=("R0", "R1"),
+                   help="soft circular mask (A): 1 inside R0, raised cosine to 0 at R1")
     s.add_argument("--n", type=int, default=0, help="random subset of particles (0 = all)")
     s.add_argument("--seed", type=int, default=0); s.add_argument("--batch", type=int, default=512)
     s.add_argument("--nb3", type=int, default=8); s.add_argument("--q3", type=int, default=16)
@@ -680,6 +794,8 @@ def main():
     c.add_argument("--dmin", type=int, default=2, help="minimum shell separation of the c2 entries used")
     c.add_argument("--min-repro", type=float, default=0.5, help="half-vs-half correlation for an entry to count as reproduced")
     c.add_argument("--pose-fit", type=int, default=0, help="also fit a viewing density (even SH degree P, e.g. 4) per structure")
+    c.add_argument("--alpha-from", default=None, help="unmasked .npz of the same particles (needed for masked data)")
+    c.add_argument("--eval-half", type=int, choices=(0, 1), default=None, help="score against one half only")
     c.add_argument("--rp-margin", type=int, default=6, help="orders beyond 2 pi k r_p treated as signal")
     c.add_argument("--envelope", choices=("gauss", "shell"), default="shell",
                    help="shell: free per-shell envelope from the c2 power (default); gauss: s exp(-dB k^2/4) fitted to a")
@@ -688,6 +804,8 @@ def main():
     x.add_argument("--dmin", type=int, default=2); x.add_argument("--min-repro", type=float, default=0.5)
     x.add_argument("--rp-margin", type=int, default=6); x.add_argument("--sign3", type=float, default=1.0)
     x.add_argument("--out", default=None)
+    x.add_argument("--alpha-from", default=None, help="unmasked .npz of the same particles (needed for masked data)")
+    x.add_argument("--use-half", type=int, choices=(0, 1), default=None, help="moments of one half only (cross-validation)")
     t = sp.add_parser("selftest")
     t.add_argument("--system", default="7N6N"); t.add_argument("--n", type=int, default=4000)
     t.add_argument("--box", type=int, default=128); t.add_argument("--pixel", type=float, default=1.2)
@@ -695,7 +813,8 @@ def main():
     if a.cmd == "selftest":
         cmd_selftest(a)
     elif a.cmd == "stack":
-        a.out = a.out or f"out/real/{os.path.basename(a.star).split('.')[0]}_{a.center}{'_n%d' % a.n if a.n else ''}.npz"
+        mtag = f"_mask{a.mask[0]:g}-{a.mask[1]:g}" if a.mask else ""
+        a.out = a.out or f"out/real/{os.path.basename(a.star).split('.')[0]}_{a.center}{mtag}{'_n%d' % a.n if a.n else ''}.npz"
         cmd_stack(a)
     elif a.cmd == "export":
         cmd_export(a)
