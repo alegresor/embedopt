@@ -176,6 +176,8 @@ def origin_sign(G, meta, root, idx, fn, rows, n=3000):
     for sgn in (0.0, 1.0, -1.0):
         num = 0
         for r, x in batches(root, idx, fn, sel, 1024):
+            ok = np.isfinite(x).all((1, 2)) & (np.abs(x).max((1, 2)) < 1e3 * np.median(np.abs(x).std((1, 2))))
+            r, x = r[ok], x[ok]
             x = Detrend(x.shape[-1])(x)
             H = ctf_of(meta, r, G.kappa)
             sh = None if sgn == 0 else sgn * np.stack([meta["ox"][r], meta["oy"][r]], 1)
@@ -214,8 +216,27 @@ def cmd_stack(a):
         sgn = max((1.0, -1.0), key=sc.get)
         print(f"centering score (none / +origins / -origins): {sc[0.0]:.4g} / {sc[1.0]:.4g} / {sc[-1.0]:.4g}; using {sgn:+.0f}")
     acc, ex, psd, det = Accumulator(G, 2, dev), Extra(G, dev), CornerPSD(meta["L"], meta["p"]), Detrend(meta["L"])
-    t0, seen = time.time(), 0
+    t0, seen, ref_std, bad, nrej = time.time(), 0, None, [], {}
     for r, x in batches(a.root, idx, fn, rows, a.batch):
+        # screen: non-finite pixels, or corner std off by > a.screen x the median of the first batch
+        f = x.reshape(len(x), -1)
+        fin = np.isfinite(f).all(1)
+        f = np.where(fin[:, None], f, 0.0)
+        cstd, fstd, fmax = f[:, det.m].std(1), f.std(1), np.abs(f).max(1)
+        if ref_std is None:
+            ref_std = float(np.median(cstd[fin]))
+        crit = dict(nonfinite=~fin,
+                    corner_std=(cstd > a.screen * ref_std) | (cstd < ref_std / a.screen),
+                    full_std=(fstd > a.screen * ref_std) | (fstd < ref_std / a.screen),
+                    max_abs=fmax > a.max_sigma * ref_std)
+        for k, v in crit.items():
+            nrej[k] = nrej.get(k, 0) + int(v.sum())
+        ok = ~np.any(list(crit.values()), 0)
+        bad += [(fn[j], int(idx[j]) + 1, float(c), float(m)) for j, c, m in zip(r[~ok], fstd[~ok], fmax[~ok])]
+        r, x = r[ok], x[ok]
+        seen += int((~ok).sum())
+        if not len(r):
+            continue
         if a.detrend:
             x = det(x)
         H = ctf_of(meta, r, G.kappa)
@@ -228,6 +249,13 @@ def cmd_stack(a):
             el = time.time() - t0
             print(f"  {seen}/{len(rows)} ({el / 60:.1f} min, ~{el * (len(rows) / seen - 1) / 60:.0f} min left)", flush=True)
     S = psd.spectrum()
+    rej = a.out.replace(".npz", "_rejected.txt")
+    with open(rej, "w") as f:
+        f.write("file\timage\tstd\tmax_abs\n")
+        f.writelines(f"{n}\t{i}\t{c:.4g}\t{m:.4g}\n" for n, i, c, m in bad)
+    nbf = len({b[0] for b in bad})
+    print(f"screening: reference corner std {ref_std:.3f}; rejected {len(bad)} of {len(rows)} images in {nbf} files "
+          f"(by criterion, overlapping: {nrej}) -> {rej}")
     if a.detrend:
         mu2, b2, nn = det.stats
         print(f"removed background: rms offset {np.sqrt(mu2 / nn):.3f}, rms gradient {np.sqrt(b2 / nn / 2):.3f} per box; "
@@ -236,7 +264,7 @@ def cmd_stack(a):
     Sig = SigF[G.L:]                                                          # q = 0..L
     full, h0, h1 = estimate(acc, ex, G, Sig, P), estimate(acc, ex, G, Sig, P, (0,)), estimate(acc, ex, G, Sig, P, (1,))
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    np.savez(a.out, **full, kappa=G.kappa, nb3=G.nb3, Q3=G.Q3, L=G.L, shells3=G.shells3, n_images=len(rows), ctf=a.ctf, detrend=a.detrend, psd_profile=S[0, : meta["L"] // 2],
+    np.savez(a.out, **full, kappa=G.kappa, nb3=G.nb3, Q3=G.Q3, L=G.L, shells3=G.shells3, n_images=len(rows) - len(bad), n_rejected=len(bad), ctf=a.ctf, detrend=a.detrend, psd_profile=S[0, : meta["L"] // 2],
              r_max=G.r_max, L_img=meta["L"], pixel=meta["p"], center=a.center, origin_sign=sgn, system=a.system,
              noise_var=float(S.mean()), **{f"h0_{k}": v for k, v in h0.items()}, **{f"h1_{k}": v for k, v in h1.items()},
              Sig=Sig, P=P, **{f"sum_{k}": getattr(acc, k).cpu().numpy() for k in ("s1", "s2", "s3")},
@@ -440,6 +468,8 @@ def main():
     s.add_argument("--center", choices=("none", "origins"), default="none")
     s.add_argument("--ctf", choices=("avg", "mean"), default="avg", help="radial CTF: in-plane average (default) or mean defocus")
     s.add_argument("--no-detrend", dest="detrend", action="store_false", help="keep the per-image background plane")
+    s.add_argument("--screen", type=float, default=10.0, help="reject images whose corner or full std is off by this factor")
+    s.add_argument("--max-sigma", type=float, default=30.0, help="reject images with a pixel beyond this many reference stds")
     s.add_argument("--n", type=int, default=0, help="random subset of particles (0 = all)")
     s.add_argument("--seed", type=int, default=0); s.add_argument("--batch", type=int, default=512)
     s.add_argument("--nb3", type=int, default=8); s.add_argument("--q3", type=int, default=16)
