@@ -1,3 +1,4 @@
+*.bak 
 logs_*.txt
 mem_probe.out
 mem_probe_*.out

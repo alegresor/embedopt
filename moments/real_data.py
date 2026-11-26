@@ -20,6 +20,7 @@ carry pose information; for comparison only). The sign convention of the origins
     python -m moments.real_data stack   --star S.star --root DIR --system 7N6N --center none    -> out/real/<tag>.npz
     python -m moments.real_data selftest [--system 7N6N]                                    (no data needed)
     python -m moments.real_data compare --data out/real/<tag>.npz --system 7N6N [--model pred.cif ...]
+    python -m moments.real_data export  --data out/real/<tag>.npz --system 7N6N     -> <tag>_corr.npz (DATA= for M12/M3=corr)
 """
 import argparse, os, re, time
 import numpy as np
@@ -519,6 +520,28 @@ def cmd_compare(a):
         print(f"   normalized data (with x*'s s, dB; usable as DATA=) -> {out}")
 
 
+# ------------------------------------------------------------------------------------------------ export for the reward
+def cmd_export(a):
+    """Data file for MOMENT_M12=corr / MOMENT_M3=corr: noise-calibrated moments plus the masks of the entries used
+    (c2 pairs |k1-k2| >= dmin and c3 triples, each reproduced by the two halves above min_repro) and sign3.
+    Uses no structure except x*'s radius (grid, as the reward itself, and the calibration's bandlimit)."""
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    D = dict(np.load(a.data))
+    atoms = load_xstar(a.system)
+    G = PolarGrid(atoms, int(D["L_img"]), float(D["pixel"]), nb3=int(D["nb3"]), Q3=int(D["Q3"]))
+    data, halves = recalibrate(D, G, atoms, dev, a.rp_margin)
+    M2b, _ = biasfree_masks(G, a.dmin)
+    keep3 = biasfree_masks(G, a.dmin)[1][:, :, 0, 0, 0]
+    h2 = pair_corr(halves[0]["c2"], halves[1]["c2"], 0)
+    h3 = pair_corr(halves[0]["c3"][keep3], halves[1]["c3"][keep3], 0)
+    M2, M3t = M2b[0] & (h2 > a.min_repro), h3 > a.min_repro
+    out = a.out or a.data.replace(".npz", "_corr.npz")
+    np.savez(out, **data, kappa=D["kappa"], nb3=D["nb3"], Q3=D["Q3"], L=D["L"], shells3=D["shells3"],
+             M2=M2, M3t=M3t, sign3=float(a.sign3), dmin=a.dmin, min_repro=a.min_repro, n_images=D["n_images"],
+             source=a.data)
+    print(f"wrote {out}: {int(M2.sum())} c2 pairs, {int(M3t.sum())} of {M3t.size} c3 triples, sign3 {a.sign3:+.0f}")
+
+
 # ------------------------------------------------------------------------------------------------ self-test
 def cmd_selftest(a):
     """1. Per-particle estimator == defocus-group estimator (moments.image_data.Accumulator) for discrete defoci, on
@@ -600,6 +623,11 @@ def main():
     c.add_argument("--rp-margin", type=int, default=6, help="orders beyond 2 pi k r_p treated as signal")
     c.add_argument("--envelope", choices=("gauss", "shell"), default="shell",
                    help="shell: free per-shell envelope from the c2 power (default); gauss: s exp(-dB k^2/4) fitted to a")
+    x = sp.add_parser("export")
+    x.add_argument("--data", required=True); x.add_argument("--system", required=True)
+    x.add_argument("--dmin", type=int, default=2); x.add_argument("--min-repro", type=float, default=0.5)
+    x.add_argument("--rp-margin", type=int, default=6); x.add_argument("--sign3", type=float, default=1.0)
+    x.add_argument("--out", default=None)
     t = sp.add_parser("selftest")
     t.add_argument("--system", default="7N6N"); t.add_argument("--n", type=int, default=4000)
     t.add_argument("--box", type=int, default=128); t.add_argument("--pixel", type=float, default=1.2)
@@ -609,6 +637,8 @@ def main():
     elif a.cmd == "stack":
         a.out = a.out or f"out/real/{os.path.basename(a.star).split('.')[0]}_{a.center}{'_n%d' % a.n if a.n else ''}.npz"
         cmd_stack(a)
+    elif a.cmd == "export":
+        cmd_export(a)
     elif a.cmd == "compare":
         cmd_compare(a)
 

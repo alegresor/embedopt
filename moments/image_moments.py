@@ -173,7 +173,7 @@ def _c3_chunk(I, w, i1, i3):
 class ImageLoss:
     """m12 and m3 against reference moments (dict a, c2, c3). m12: plain | white; m3: block | perq | white."""
 
-    M12, M3 = ("plain", "white"), ("block", "perq", "white", "wblock")
+    M12, M3 = ("plain", "white", "corr"), ("block", "perq", "white", "wblock", "corr")
 
     def __init__(self, ref, im=None, m12="plain", m3="block", drop=2, rcond=1e-6, rcond_b=1e-9, all_variants=False):
         if m12 not in self.M12 or m3 not in self.M3:
@@ -183,6 +183,8 @@ class ImageLoss:
         n = ref["c3"].abs().pow(2).sum(dim=(2, 3, 4))
         self.keep, self.n3 = n > 1e-12 * n.max(), n
         self.info = ""
+        if "corr" in (m12, m3):
+            self._corr_init(ref)
         if m12 == "white" or all_variants:
             # C~_l = B^-1 c2* per shell pair (float64), degrees l <= L - drop
             L = ref["c2"].shape[0] - 1
@@ -228,8 +230,35 @@ class ImageLoss:
         with full_precision():
             return (self.Wb.T.to(torch.complex128) @ self._rows(c3)).abs().pow(2).sum()
 
+    def _corr_init(self, ref):
+        """Masks and data norms of the correlation loss. Defaults without masks in the data: c2 pairs |i-j| >= 2,
+        all c3 triples, sign +1."""
+        c2, c3 = ref["c2"], ref["c3"]
+        NK, dev = c2.shape[1], c2.device
+        k = torch.arange(NK, device=dev)
+        self.M2 = ref["M2"].bool() if "M2" in ref else (k[:, None] - k[None]).abs() >= 2
+        Q = c3.shape[0]
+        qs = torch.arange(Q, device=dev) - (Q - 1) // 2
+        self.B3 = (qs[:, None] != 0) & (qs[None] != 0) & ((qs[:, None] + qs[None]) != 0)        # q1, q2, q3 != 0
+        self.T3 = ref["M3t"].bool() if "M3t" in ref else torch.ones(c3.shape[2:], dtype=torch.bool, device=dev)
+        self.sign3 = float(ref.get("sign3", 1.0))
+        self.n2d = c2.to(torch.complex128).abs().pow(2).sum(0)                                   # (NK, NK)
+        self.n3d = c3.to(torch.complex128)[self.B3].abs().pow(2).sum(0)                          # (S, S, S)
+        self.info += (f"corr: {int(self.M2.sum())} c2 shell pairs, {int(self.T3.sum())} c3 triples x "
+                      f"{int(self.B3.sum())} blocks, sign3 {self.sign3:+.0f}; ")
+
+    @staticmethod
+    def _rho(x, d, nd):
+        """Re<x, d> / (|x| |d|) summed over the leading axis (float64)."""
+        x = x.to(torch.complex128)
+        num = (x.conj() * d.to(torch.complex128)).real.sum(0)
+        return num / (x.abs().pow(2).sum(0) * nd).clamp_min(1e-300).sqrt()
+
     def m12(self, m, mode=None):
         mode = mode or self.mode12
+        if mode == "corr":
+            rho = self._rho(m["c2"], self.ref["c2"], self.n2d)
+            return (1 - rho[self.M2].mean()).to(m["c2"].real.dtype)
         e_a = (m["a"] - self.ref["a"]).abs().pow(2).sum() / self.na
         if mode == "white":
             return e_a + (m["C"][: self.lw] - self.Ct).abs().pow(2).sum() / self.nC
@@ -237,6 +266,9 @@ class ImageLoss:
 
     def m3(self, m, mode=None):
         mode = mode or self.mode3
+        if mode == "corr":
+            rho = self._rho(m["c3"][self.B3], self.ref["c3"][self.B3], self.n3d)
+            return (1 - self.sign3 * rho[self.T3].mean()).to(m["c3"].real.dtype)
         d = m["c3"] - self.ref["c3"]
         if mode == "perq":
             return (self._perq(d) / self.nP).to(m["c3"].real.dtype)
@@ -284,7 +316,13 @@ def load_data(src, im, A_ref):
     if bad:
         raise ValueError(f"image data {src} does not match the reward grid: " + "; ".join(bad))
     dev = im.beta.device
-    return {k: torch.as_tensor(d[k], dtype=im.cdt, device=dev) for k in ("a", "c2", "c3")}
+    out = {k: torch.as_tensor(d[k], dtype=im.cdt, device=dev) for k in ("a", "c2", "c3")}
+    for k in ("M2", "M3t"):                                      # masks of the correlation loss (real_data export)
+        if k in d:
+            out[k] = torch.as_tensor(d[k], dtype=torch.bool, device=dev)
+    if "sign3" in d:
+        out["sign3"] = float(d["sign3"])
+    return out
 
 
 # ----------------------------------------------------------------------------------------------- self-test
