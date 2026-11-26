@@ -32,16 +32,31 @@ groups = []
 for e in ents:
     chains = [ch.name for ch in model if len(ch.get_polymer()) and ch.get_polymer().subchain_id() in e.subchains]
     if not chains: continue
-    seqs = [[r.label_seq for r in model[c].get_polymer()] for c in chains]
-    lo, hi = max(min(s) for s in seqs), min(max(s) for s in seqs)
-    for c, s in zip(chains, seqs):
-        gap = sorted(set(range(lo, hi + 1)) - set(s))
-        if gap: sys.exit(f"entity {e.name} chain {c}: unmodeled residues {gap} inside {lo}-{hi}")
     full = gemmi.one_letter_code([gemmi.Entity.first_mon(m) for m in e.full_sequence])
-    if "X" in full[lo - 1:hi]: sys.exit(f"entity {e.name}: non-standard residue in modeled range: {full[lo - 1:hi]}")
-    groups.append(dict(entity=e.name, chains=chains, lo=lo, hi=hi, seq=full[lo - 1:hi], full=full))
-    print(f"entity {e.name}: chains {chains}, modeled {lo}-{hi} of {len(full)} "
-          f"(dropped {lo - 1} N-term, {len(full) - hi} C-term): {full[lo - 1:hi]}")
+    seqs = {c: [r.label_seq for r in model[c].get_polymer()] for c in chains}
+    # copies modeled over different ranges (e.g. a protease chain and a peptide of the same entity) become
+    # separate sequences; copies with the same range share one (count = number of copies)
+    byrange = {}
+    for c in chains:
+        byrange.setdefault((min(seqs[c]), max(seqs[c])), []).append(c)
+    if len(byrange) > 1:
+        # merge ranges that nearly coincide (termini differing by a few residues) by intersecting them
+        merged = []
+        for (lo, hi), cs in sorted(byrange.items(), key=lambda kv: -(kv[0][1] - kv[0][0])):
+            for m in merged:
+                if min(hi, m[1]) - max(lo, m[0]) >= 0.9 * max(hi - lo, m[1] - m[0]):
+                    m[0], m[1] = max(lo, m[0]), min(hi, m[1]); m[2] += cs; break
+            else:
+                merged.append([lo, hi, list(cs)])
+        byrange = {(lo, hi): cs for lo, hi, cs in merged}
+    for (lo, hi), cs in byrange.items():
+        for c in cs:
+            gap = sorted(set(range(lo, hi + 1)) - set(seqs[c]))
+            if gap: sys.exit(f"entity {e.name} chain {c}: unmodeled residues {gap} inside {lo}-{hi}")
+        if "X" in full[lo - 1:hi]: sys.exit(f"entity {e.name}: non-standard residue in modeled range: {full[lo - 1:hi]}")
+        groups.append(dict(entity=e.name, chains=cs, lo=lo, hi=hi, seq=full[lo - 1:hi], full=full))
+        print(f"entity {e.name}: chains {cs}, modeled {lo}-{hi} of {len(full)} "
+              f"(dropped {lo - 1} N-term, {len(full) - hi} C-term): {full[lo - 1:hi]}")
 
 left = [ch.name for ch in model if len(ch.get_polymer()) and ch.name not in {c for g in groups for c in g["chains"]}]
 if left: sys.exit(f"polymer chains {left} not assigned to any entity")
