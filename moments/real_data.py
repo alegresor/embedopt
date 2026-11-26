@@ -474,7 +474,23 @@ def correlations(data, halves, m, G, dmin):
 _BASIS = {}                                                  # basis moments per (structure coefficients, P)
 
 
-def fit_pose_corr(A, im, G, data, rel2, rel3, keep3, P, dev, sign3=1.0, mix=None):
+def sh_density(P, odd=False):
+    """moments.pose_moments.SHDensity (even degrees 2..P), or with all degrees 1..P (odd=True): the odd part of nu
+    (nu(n) != nu(-n)) weights Im c3 (images from -n are mirror images of those from n; c2 cannot see it)."""
+    from moments.pose_moments import SHDensity
+
+    d = SHDensity(P)
+    if odd:
+        d.terms = []
+        for p in range(1, P + 1):
+            d.terms.append((p, 0, 0))
+            for u in range(1, p + 1):
+                d.terms += [(p, u, 1), (p, u, 2)]
+        d.K = len(d.terms)
+    return d
+
+
+def fit_pose_corr(A, im, G, data, rel2, rel3, keep3, P, dev, sign3=1.0, mix=None, odd=False):
     """Viewing density nu_theta (real even SH up to P, moments.pose_moments) maximizing the mean c2 + c3 correlation
     with the data over the reproduced entries; nu >= 0 at 400 directions. Moments are affine in t = (1, theta), so
     each entry's correlation is (n.t) / sqrt(t'Gt |d|^2) with n, G precomputed: exact objective and gradient."""
@@ -483,17 +499,21 @@ def fit_pose_corr(A, im, G, data, rel2, rel3, keep3, P, dev, sign3=1.0, mix=None
 
     pm = PoseMoments(int(im.L), int(im.LB), int(im.nphi), len(G.kappa), np.asarray(G.shells3), int(G.Q3), P=P, dtype=np.complex64,
                      backend="torch", device=dev)
-    dens = SHDensity(P)
+    dens = sh_density(P, odd)
     np_ = lambda x: x.detach().cpu().numpy().astype(np.complex128) if torch.is_tensor(x) else np.asarray(x, np.complex128)
     c2, c3 = 0, 0
     for Ai, wi in (mix or [(A, 1.0)]):                  # mixture: moments are linear in the particle fractions
-        key = (np.shape(Ai), complex(np.asarray(Ai).sum()), float(np.abs(np.asarray(Ai)).sum()), P)   # content, not id()
+        key = (np.shape(Ai), complex(np.asarray(Ai).sum()), float(np.abs(np.asarray(Ai)).sum()), P, odd)   # content
         if key not in _BASIS:
             basis = pm.basis_moments(torch.as_tensor(Ai, dtype=torch.complex64, device=dev), dens, third=True)
             _BASIS[key] = (np.stack([np_(b["c2"]) for b in basis])[:, :, rel2],
                            np.stack([np_(b["c3"]) for b in basis])[:, keep3][..., rel3])
         b2, b3 = _BASIS[key]
         c2, c3 = c2 + wi * b2, c3 + wi * b3                                        # (K+1, q, E2), (K+1, blocks, E3)
+        if odd and wi == (mix or [(A, 1.0)])[0][1]:
+            io = [k + 1 for k, t in enumerate(dens.terms) if t[0] % 2 == 1]
+            r = lambda b: float(np.linalg.norm(b[io]) / np.linalg.norm(b[0]) / np.sqrt(len(io)))
+            print(f"      odd-degree basis moments, rms relative to uniform: c2 {r(b2):.1e}, c3 {r(b3):.1e}")
     d2, d3 = data["c2"][:, rel2], data["c3"][keep3][..., rel3]
     terms = []
     for c, d, sg in ((c2, d2, 1.0), (c3, d3, sign3)):
@@ -677,7 +697,7 @@ def cmd_compare(a):
                 rel2_, rel3_ = pairs_ & (h2_ > a.min_repro), h3_ > a.min_repro
                 keep3_ = biasfree_masks(G, a.dmin)[1][:, :, 0, 0, 0]
                 t0 = time.time()
-                pf = fit_pose_corr(A_, im, G, data, rel2_, rel3_, keep3_, a.pose_fit, dev)
+                pf = fit_pose_corr(A_, im, G, data, rel2_, rel3_, keep3_, a.pose_fit, dev, odd=a.pose_odd)
                 pose_rows.append((name, pf))
                 print(f"   [{name}] fitted viewing density (P={a.pose_fit}): c2 {pf['c2']:+.3f}, c3 {pf['c3']:+.3f} "
                       f"(nu in [{pf['nu_min']:.2f}, {pf['nu_max']:.2f}]; {time.time() - t0:.0f} s; {pf['msg']})")
@@ -874,6 +894,7 @@ def main():
     c.add_argument("--dmin", type=int, default=2, help="minimum shell separation of the c2 entries used")
     c.add_argument("--min-repro", type=float, default=0.5, help="half-vs-half correlation for an entry to count as reproduced")
     c.add_argument("--pose-fit", type=int, default=0, help="also fit a viewing density (even SH degree P, e.g. 4) per structure")
+    c.add_argument("--pose-odd", action="store_true", help="viewing density with odd degrees too (nu(n) != nu(-n))")
     c.add_argument("--alpha-from", default=None, help="unmasked .npz of the same particles (needed for masked data)")
     c.add_argument("--eval-half", type=int, choices=(0, 1), default=None, help="score against one half only")
     c.add_argument("--mix-with", default=None, help="structure mixed with x* (e.g. the monomer decoy)")
