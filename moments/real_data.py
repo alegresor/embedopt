@@ -338,6 +338,84 @@ def normalize(m, s, dB, kappa, sh3, e=None):
                 c3=m["c3"] / (es[:, None, None] * es[None, :, None] * es[None, None]))
 
 
+# ------------------------------------------------------------------------------------------------ bias-free comparison
+def biasfree_masks(G, dmin):
+    """c2: shell pairs |k1 - k2| >= dmin (noise correlated only through the box kernel); c3: blocks with q1, q2, q3 != 0
+    (the bias T P lives only in blocks with a zero index). Both free of noise bias for any stationary noise."""
+    NK, qs = len(G.kappa), np.arange(-G.Q3, G.Q3 + 1)
+    k = np.arange(NK)
+    M2 = np.broadcast_to(np.abs(k[:, None] - k[None]) >= dmin, (G.L + 1, NK, NK))
+    q3 = -(qs[:, None] + qs[None])
+    M3 = ((qs[:, None] != 0) & (qs[None] != 0) & (q3 != 0))[:, :, None, None, None]
+    return M2, np.broadcast_to(M3, (len(qs), len(qs)) + (G.nb3,) * 3)
+
+
+def offdiag_envelope(d2, m2, M2, sign, iters=200):
+    """Per-shell e minimizing sum_{M2} |c2d(k1,k2) - e1 e2 c2m(k1,k2)|^2 (alternating least squares), signed."""
+    W = M2[0].astype(float)
+    num = np.einsum("qij,qij->ij", np.conj(m2), d2).real * W                    # <c2m, c2d> per pair
+    den = np.einsum("qij,qij->ij", np.conj(m2), m2).real * W
+    e = np.sqrt(np.maximum(np.abs(num).sum(1) / den.sum(1), 1e-300))
+    for _ in range(iters):     # simultaneous update maps c e -> e / c (period-2 cycle); the geometric mean removes it
+        e = np.sqrt(e * np.maximum((num @ e) / (den @ e**2), 1e-12))
+    return sign * e
+
+
+def mrel(d, m, M):
+    return float(np.linalg.norm((d - m)[M]) / np.linalg.norm(m[M]))
+
+
+def pair_corr(x, y, axes):
+    """Normalized correlation Re<x, y> / (|x| |y|) over `axes`, per remaining index (scale-invariant per block)."""
+    num = np.sum(np.conj(x) * y, axis=axes).real
+    return num / np.sqrt(np.sum(np.abs(x) ** 2, axis=axes) * np.sum(np.abs(y) ** 2, axis=axes) + 1e-300)
+
+
+def correlations(data, halves, m, G, dmin):
+    """rho2[i,j] over q for c2 shell pairs |i-j| >= dmin; rho3[a,b,c] over nonzero-q blocks for c3 shell triples.
+    Also the half-vs-half correlations (reproducibility of each entry in the data)."""
+    M2, M3 = biasfree_masks(G, dmin)
+    pairs = M2[0]
+    r2 = pair_corr(m["c2"], data["c2"], 0)
+    h2 = pair_corr(halves[0]["c2"], halves[1]["c2"], 0)
+    keep = M3[:, :, 0, 0, 0]
+    c3m, c3d = m["c3"][keep], data["c3"][keep]                              # (nblocks, S, S, S)
+    r3 = pair_corr(c3m, c3d, 0)
+    h3 = pair_corr(halves[0]["c3"][keep], halves[1]["c3"][keep], 0)
+    return r2, h2, pairs, r3, h3
+
+
+def compare_biasfree(name, data, halves, m, G, dmin, rows):
+    M2, M3 = biasfree_masks(G, dmin)
+    sign = np.sign((data["a"][0] / m["a"][0]).real) or 1.0
+    e = offdiag_envelope(data["c2"], m["c2"], M2, sign)
+    dn = normalize(data, 0, 0, G.kappa, G.shells3, e)
+    hn = [normalize(h, 0, 0, G.kappa, G.shells3, e) for h in halves]
+    L2, L3 = mrel(dn["c2"], m["c2"], M2) ** 2, mrel(dn["c3"], m["c3"], M3) ** 2
+    F2 = mrel(m["c2"] + hn[0]["c2"] - hn[1]["c2"], m["c2"], M2) ** 2 / 4
+    F3 = mrel(m["c3"] + hn[0]["c3"] - hn[1]["c3"], m["c3"], M3) ** 2 / 4
+    rows.append((name, L2, F2, L3, F3))
+    print(f"\n== {name} (bias-free entries: c2 |k1-k2| >= {dmin}, c3 blocks q1,q2,q3 != 0)")
+    print("   envelope e(k)/e(k1): " + " ".join(f"{v:.2f}" for v in np.abs(e / e[0])))
+    K = G.kappa
+    Bk = -2 * np.log(np.abs(e[1:] / e[0])) / (K[1:] ** 2 - K[0] ** 2)
+    print("   implied B (A^2):     " + " ".join(f"{v:.0f}" for v in Bk))
+    print("   shell  1/kappa(A)  c2 row rel err (half-split)   c3 diag-block rel err (half-split)")
+    for i in range(len(K)):
+        Mi = np.zeros_like(M2); Mi[:, i, :] = M2[:, i, :]
+        e2 = mrel(dn["c2"], m["c2"], Mi)
+        n2 = mrel(m["c2"] + hn[0]["c2"] - hn[1]["c2"], m["c2"], Mi) / 2
+        line = f"   {i + 1:>5}  {1 / K[i]:>10.1f}  {e2:>10.3f} ({n2:.3f})"
+        if i in G.shells3:
+            j = int(np.flatnonzero(G.shells3 == i)[0])
+            Mj = np.zeros_like(M3); Mj[..., j, j, j] = M3[..., j, j, j]
+            e3 = mrel(dn["c3"], m["c3"], Mj)
+            n3 = mrel(m["c3"] + hn[0]["c3"] - hn[1]["c3"], m["c3"], Mj) / 2
+            line += f"          {e3:>10.3f} ({n3:.3f})"
+        print(line)
+    return dn, e
+
+
 def losses(ref, test, dev):
     """Default image-space losses of the reward (m12 plain, m3 block) of `test` against `ref` (here the model, whose
     norms and nonzero c3 blocks define the normalization; noisy data would also keep its noise-only blocks)."""
@@ -368,6 +446,42 @@ def cmd_compare(a):
     if "sum_s2" in D and not a.no_calib:
         data, halves = recalibrate(D, G, atoms, dev, a.rp_margin)
     models = [("x*", atoms)] + [(os.path.basename(p), structure_atoms(p)) for p in a.model]
+    if "Sig" in D:
+        Sg = np.abs(D["Sig"]).max(0)
+        cor = Sg / np.sqrt(np.outer(np.diag(Sg), np.diag(Sg)))
+        print("   max |noise correlation| between shells at separation d = 1, 2, 3: "
+              + ", ".join(f"{max(cor[i, i + d] for i in range(len(cor) - d)):.1e}" for d in (1, 2, 3)))
+    if a.biasfree:
+        rows, cors = [], []
+        for name, at in models:
+            m, im, _ = model_moments(G, at, dev)
+            m = {k: v.detach().cpu().numpy() for k, v in m.items() if k in ("a", "c2", "c3")}
+            if name == "x*":
+                dn, e = compare_biasfree(name, data, halves, m, G, a.dmin, rows)
+                out = a.data.replace(".npz", f"_norm_{a.system}_biasfree.npz")
+                np.savez(out, **{**D, **dn}, fit_e=e, dmin=a.dmin)
+                print(f"   normalized data (envelope from x*) -> {out}")
+            cors.append((name,) + correlations(data, halves, m, G, a.dmin))
+        # envelope-free comparison: correlation per bias-free entry, on entries the data reproduce
+        _, _, h2, pairs, _, h3 = cors[0]
+        rel2 = pairs & (h2 > a.min_repro)
+        rel3 = h3 > a.min_repro
+        NK = len(G.kappa)
+        print(f"\n   envelope-free correlation with the data (c2 pairs |k1-k2| >= {a.dmin}, c3 triples, nonzero-q blocks)")
+        print(f"   entries reproduced by the data (half-vs-half corr > {a.min_repro}): c2 {int(rel2.sum())} of "
+              f"{int(pairs.sum())} pairs, c3 {int(rel3.sum())} of {rel3.size} triples; "
+              f"median half-vs-half corr c2 {np.median(h2[pairs]):.3f}, c3 {np.median(h3):.3f}")
+        print("   structure                        c2 mean corr (reproduced / all)   c3 mean corr (reproduced / all)")
+        for name, r2, _, _, r3, _ in cors:
+            print(f"   {name[:32]:<32} {r2[rel2].mean() if rel2.any() else np.nan:>+8.3f} / {r2[pairs].mean():+.3f}"
+                  f"               {r3[rel3].mean() if rel3.any() else np.nan:>+8.3f} / {r3.mean():+.3f}")
+        print("   per shell (c2 row mean corr over reproduced pairs): structure: " + " ".join(f"{i + 1:>5}" for i in range(NK)))
+        for name, r2, _, _, _, _ in cors:
+            row = [r2[i][rel2[i]].mean() if rel2[i].any() else np.nan for i in range(NK)]
+            print(f"   {name[:24]:<24} " + " ".join(f"{v:+.2f}" for v in row))
+        hrow = [h2[i][pairs[i]].mean() for i in range(NK)]
+        print(f"   {'(half vs half)':<24} " + " ".join(f"{v:+.2f}" for v in hrow))
+        return
     print(f"{a.data}: {int(D['n_images'])} images, center={D['center']}; fit (s, dB) on shells {a.fit_from + 1}..{len(K)}")
     for name, at in models:
         m, im, _ = model_moments(G, at, dev)
@@ -480,6 +594,9 @@ def main():
     c.add_argument("--model", nargs="*", default=[]); c.add_argument("--fit-from", type=int, default=0,
                                                                      help="first shell index used in the (s, dB) fit")
     c.add_argument("--no-calib", action="store_true", help="use the corner noise estimate as is")
+    c.add_argument("--diag", dest="biasfree", action="store_false", help="old comparison incl. noise-biased entries")
+    c.add_argument("--dmin", type=int, default=2, help="minimum shell separation of the c2 entries used")
+    c.add_argument("--min-repro", type=float, default=0.5, help="half-vs-half correlation for an entry to count as reproduced")
     c.add_argument("--rp-margin", type=int, default=6, help="orders beyond 2 pi k r_p treated as signal")
     c.add_argument("--envelope", choices=("gauss", "shell"), default="shell",
                    help="shell: free per-shell envelope from the c2 power (default); gauss: s exp(-dB k^2/4) fitted to a")
