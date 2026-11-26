@@ -471,7 +471,10 @@ def correlations(data, halves, m, G, dmin):
     return r2, h2, pairs, r3, h3
 
 
-def fit_pose_corr(A, im, G, data, rel2, rel3, keep3, P, dev, sign3=1.0):
+_BASIS = {}                                                  # basis moments per (structure coefficients, P)
+
+
+def fit_pose_corr(A, im, G, data, rel2, rel3, keep3, P, dev, sign3=1.0, mix=None):
     """Viewing density nu_theta (real even SH up to P, moments.pose_moments) maximizing the mean c2 + c3 correlation
     with the data over the reproduced entries; nu >= 0 at 400 directions. Moments are affine in t = (1, theta), so
     each entry's correlation is (n.t) / sqrt(t'Gt |d|^2) with n, G precomputed: exact objective and gradient."""
@@ -481,10 +484,16 @@ def fit_pose_corr(A, im, G, data, rel2, rel3, keep3, P, dev, sign3=1.0):
     pm = PoseMoments(int(im.L), int(im.LB), int(im.nphi), len(G.kappa), np.asarray(G.shells3), int(G.Q3), P=P, dtype=np.complex64,
                      backend="torch", device=dev)
     dens = SHDensity(P)
-    basis = pm.basis_moments(torch.as_tensor(A, dtype=torch.complex64, device=dev), dens, third=True)
     np_ = lambda x: x.detach().cpu().numpy().astype(np.complex128) if torch.is_tensor(x) else np.asarray(x, np.complex128)
-    c2 = np.stack([np_(b["c2"]) for b in basis])[:, :, rel2]                   # (K+1, q, E2)
-    c3 = np.stack([np_(b["c3"]) for b in basis])[:, keep3][..., rel3]          # (K+1, blocks, E3)
+    c2, c3 = 0, 0
+    for Ai, wi in (mix or [(A, 1.0)]):                  # mixture: moments are linear in the particle fractions
+        key = (np.shape(Ai), complex(np.asarray(Ai).sum()), float(np.abs(np.asarray(Ai)).sum()), P)   # content, not id()
+        if key not in _BASIS:
+            basis = pm.basis_moments(torch.as_tensor(Ai, dtype=torch.complex64, device=dev), dens, third=True)
+            _BASIS[key] = (np.stack([np_(b["c2"]) for b in basis])[:, :, rel2],
+                           np.stack([np_(b["c3"]) for b in basis])[:, keep3][..., rel3])
+        b2, b3 = _BASIS[key]
+        c2, c3 = c2 + wi * b2, c3 + wi * b3                                        # (K+1, q, E2), (K+1, blocks, E3)
     d2, d3 = data["c2"][:, rel2], data["c3"][keep3][..., rel3]
     terms = []
     for c, d, sg in ((c2, d2, 1.0), (c3, d3, sign3)):
@@ -513,6 +522,73 @@ def fit_pose_corr(A, im, G, data, rel2, rel3, keep3, P, dev, sign3=1.0):
     nu = 1 + Phi @ r.x
     return dict(c2=float(rho[0].mean()), c3=float(rho[1].mean()), nu_max=float(nu.max()), nu_min=float(nu.min()),
                 uniform=(-f(np.zeros(dens.K))[0]), ok=bool(r.success), msg=str(r.message))
+
+
+def mixture_scan(a, G, atoms, data, halves, dev, rel2, rel3):
+    """Correlation of (1-w) m(x*) + w m(other) with the data over particle fractions w (uniform viewing density, and
+    with a fitted density if --pose-fit)."""
+    other = structure_atoms(a.mix_with)
+    m0, im, A0 = model_moments(G, atoms, dev)
+    m1, _, A1 = model_moments(G, other, dev)
+    m0, m1 = ({k: v.detach().cpu().numpy() for k, v in m.items() if k in ("a", "c2", "c3")} for m in (m0, m1))
+    keep3 = biasfree_masks(G, a.dmin)[1][:, :, 0, 0, 0]
+    print(f"\n   mixture of x* and {os.path.basename(a.mix_with)} (particle fraction w of the latter; reproduced entries)")
+    print("        w    c2 corr   c3 corr" + ("    c2 / c3 with fitted density" if a.pose_fit else ""))
+    for w in a.mix_w:
+        mw = {k: (1 - w) * m0[k] + w * m1[k] for k in ("a", "c2", "c3")}
+        r2, _, _, r3, _ = correlations(data, halves, mw, G, a.dmin)
+        line = f"    {w:5.2f}    {r2[rel2].mean():+.3f}    {r3[rel3].mean():+.3f}"
+        if a.pose_fit:
+            pf = fit_pose_corr(A0, im, G, data, rel2, rel3, keep3, a.pose_fit, dev, mix=[(A0, 1 - w), (A1, w)])
+            line += f"         {pf['c2']:+.3f} / {pf['c3']:+.3f}"
+        print(line, flush=True)
+
+
+def model_moments_B(G, atoms, B, dev):
+    """moments.image_data.model_moments with per-atom isotropic B-factors B (N,) instead of a uniform 50 A^2."""
+    from moments import image_checks as ic
+    from moments.invariants import form_factors
+    from moments.image_moments import ImageMoments
+
+    x = atoms.coord.astype(np.float64)
+    x = x - x.mean(0)
+    rho = form_factors(atoms.element, G.kappa, 0.0) * np.exp(-np.asarray(B, float)[:, None] * G.kappa[None] ** 2 / 4)
+    omega, WYc = ic.s2_quadrature64(G.L)
+    A = ic.coefficients64(x, rho, G.kappa, omega, WYc)
+    im = ImageMoments(G.kappa, G.r_max, L=G.L, nb3=G.nb3, Q3=G.Q3, dev=dev, dtype=torch.float64)
+    m = im.moments(torch.as_tensor(A, dtype=torch.complex128, device=dev))
+    return {k: v.detach().cpu().numpy() for k, v in m.items() if k in ("a", "c2", "c3")}, im, A
+
+
+def deposited_B(atoms, cif):
+    """Per-atom B of x* from the deposited mmCIF, matched by (chain, residue, atom name); missing -> median."""
+    import biotite.structure.io.pdbx as pdbx
+
+    st = pdbx.get_structure(pdbx.CIFFile.read(cif), model=1, extra_fields=["b_factor"])
+    lut = {(c, int(r), n): float(b) for c, r, n, b in zip(st.chain_id, st.res_id, st.atom_name, st.b_factor)}
+    B = np.array([lut.get((c, int(r), n), np.nan) for c, r, n in zip(atoms.chain_id, atoms.res_id, atoms.atom_name)])
+    miss = np.isnan(B)
+    B[miss] = np.nanmedian(B)
+    return B, int(miss.sum())
+
+
+def bfactor_scan(a, G, atoms, data, halves, dev, rel2, rel3):
+    """Correlation of x* with per-atom B = mean + gamma (B_dep - mean) (gamma = 0: uniform; 1: deposited)."""
+    B, nmiss = deposited_B(atoms, a.bfactor_cif)
+    mu = B.mean()
+    keep3 = biasfree_masks(G, a.dmin)[1][:, :, 0, 0, 0]
+    print(f"\n   x* with deposited per-atom B-factors ({a.bfactor_cif}; {nmiss} of {len(B)} atoms unmatched -> median): "
+          f"mean {mu:.0f}, 5/50/95% {np.percentile(B, [5, 50, 95]).round(0)} A^2")
+    print("    gamma    c2 corr   c3 corr" + ("    c2 / c3 with fitted density" if a.pose_fit else ""))
+    for g in a.bgamma:
+        Bg = np.maximum(mu + g * (B - mu), 0.0)
+        m, im, A = model_moments_B(G, atoms, Bg, dev)
+        r2, _, _, r3, _ = correlations(data, halves, m, G, a.dmin)
+        line = f"    {g:5.2f}    {r2[rel2].mean():+.3f}    {r3[rel3].mean():+.3f}"
+        if a.pose_fit:
+            pf = fit_pose_corr(A, im, G, data, rel2, rel3, keep3, a.pose_fit, dev)
+            line += f"         {pf['c2']:+.3f} / {pf['c3']:+.3f}"
+        print(line, flush=True)
 
 
 def compare_biasfree(name, data, halves, m, G, dmin, rows):
@@ -624,6 +700,10 @@ def cmd_compare(a):
             print(f"   {name[:24]:<24} " + " ".join(f"{v:+.2f}" for v in row))
         hrow = [h2[i][pairs[i]].mean() for i in range(NK)]
         print(f"   {'(half vs half)':<24} " + " ".join(f"{v:+.2f}" for v in hrow))
+        if a.mix_with:
+            mixture_scan(a, G, atoms, data, halves, dev, rel2, rel3)
+        if a.bfactor_cif:
+            bfactor_scan(a, G, atoms, data, halves, dev, rel2, rel3)
         if pose_rows:
             print(f"\n   with a fitted viewing density (P = {a.pose_fit}; reproduced entries): structure: c2 uniform -> fitted, "
                   f"c3 uniform -> fitted")
@@ -796,6 +876,10 @@ def main():
     c.add_argument("--pose-fit", type=int, default=0, help="also fit a viewing density (even SH degree P, e.g. 4) per structure")
     c.add_argument("--alpha-from", default=None, help="unmasked .npz of the same particles (needed for masked data)")
     c.add_argument("--eval-half", type=int, choices=(0, 1), default=None, help="score against one half only")
+    c.add_argument("--mix-with", default=None, help="structure mixed with x* (e.g. the monomer decoy)")
+    c.add_argument("--mix-w", type=float, nargs="+", default=[0, 0.05, 0.1, 0.2, 0.3, 0.5, 0.7, 1.0])
+    c.add_argument("--bfactor-cif", default=None, help="deposited mmCIF of x*: scan per-atom B-factors")
+    c.add_argument("--bgamma", type=float, nargs="+", default=[0, 0.5, 1, 1.5, 2, 3])
     c.add_argument("--rp-margin", type=int, default=6, help="orders beyond 2 pi k r_p treated as signal")
     c.add_argument("--envelope", choices=("gauss", "shell"), default="shell",
                    help="shell: free per-shell envelope from the c2 power (default); gauss: s exp(-dB k^2/4) fitted to a")
