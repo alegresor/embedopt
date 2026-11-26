@@ -386,6 +386,50 @@ def correlations(data, halves, m, G, dmin):
     return r2, h2, pairs, r3, h3
 
 
+def fit_pose_corr(A, im, G, data, rel2, rel3, keep3, P, dev, sign3=1.0):
+    """Viewing density nu_theta (real even SH up to P, moments.pose_moments) maximizing the mean c2 + c3 correlation
+    with the data over the reproduced entries; nu >= 0 at 400 directions. Moments are affine in t = (1, theta), so
+    each entry's correlation is (n.t) / sqrt(t'Gt |d|^2) with n, G precomputed: exact objective and gradient."""
+    from scipy.optimize import minimize
+    from moments.pose_moments import PoseMoments, SHDensity, collocation
+
+    pm = PoseMoments(int(im.L), int(im.LB), int(im.nphi), len(G.kappa), np.asarray(G.shells3), int(G.Q3), P=P, dtype=np.complex64,
+                     backend="torch", device=dev)
+    dens = SHDensity(P)
+    basis = pm.basis_moments(torch.as_tensor(A, dtype=torch.complex64, device=dev), dens, third=True)
+    np_ = lambda x: x.detach().cpu().numpy().astype(np.complex128) if torch.is_tensor(x) else np.asarray(x, np.complex128)
+    c2 = np.stack([np_(b["c2"]) for b in basis])[:, :, rel2]                   # (K+1, q, E2)
+    c3 = np.stack([np_(b["c3"]) for b in basis])[:, keep3][..., rel3]          # (K+1, blocks, E3)
+    d2, d3 = data["c2"][:, rel2], data["c3"][keep3][..., rel3]
+    terms = []
+    for c, d, sg in ((c2, d2, 1.0), (c3, d3, sign3)):
+        n = sg * np.einsum("kqe,qe->ke", np.conj(c), d).real                     # (K+1, E)
+        Gm = np.einsum("kqe,lqe->kle", np.conj(c), c).real                       # (K+1, K+1, E)
+        nd = np.sqrt((np.abs(d) ** 2).sum(0))
+        terms.append((n, Gm, nd))
+
+    def f(th):
+        t = np.concatenate([[1.0], th])
+        val, grad = 0.0, np.zeros_like(t)
+        for n, Gm, nd in terms:
+            a = t @ n                                                              # (E,)
+            Gt = np.einsum("kle,l->ke", Gm, t)
+            b = np.maximum(t @ Gt, 1e-300)
+            rho = a / (np.sqrt(b) * nd)
+            val += rho.mean()
+            grad += ((n / (np.sqrt(b) * nd) - Gt * a / (b**1.5 * nd)).mean(1))
+        return -val, -grad[1:]
+
+    Phi = dens.basis_values(collocation(400)).T                                    # (400, K)
+    cons = dict(type="ineq", fun=lambda th: 1 + Phi @ th, jac=lambda th: Phi)
+    r = minimize(f, np.zeros(dens.K), jac=True, constraints=[cons], method="SLSQP", options=dict(maxiter=300))
+    t = np.concatenate([[1.0], r.x])
+    rho = [(t @ n) / (np.sqrt(np.einsum("k,kle,l->e", t, Gm, t)) * nd) for n, Gm, nd in terms]
+    nu = 1 + Phi @ r.x
+    return dict(c2=float(rho[0].mean()), c3=float(rho[1].mean()), nu_max=float(nu.max()), nu_min=float(nu.min()),
+                uniform=(-f(np.zeros(dens.K))[0]), ok=bool(r.success), msg=str(r.message))
+
+
 def compare_biasfree(name, data, halves, m, G, dmin, rows):
     M2, M3 = biasfree_masks(G, dmin)
     sign = np.sign((data["a"][0] / m["a"][0]).real) or 1.0
@@ -453,9 +497,9 @@ def cmd_compare(a):
         print("   max |noise correlation| between shells at separation d = 1, 2, 3: "
               + ", ".join(f"{max(cor[i, i + d] for i in range(len(cor) - d)):.1e}" for d in (1, 2, 3)))
     if a.biasfree:
-        rows, cors = [], []
+        rows, cors, pose_rows = [], [], []
         for name, at in models:
-            m, im, _ = model_moments(G, at, dev)
+            m, im, A_ = model_moments(G, at, dev)
             m = {k: v.detach().cpu().numpy() for k, v in m.items() if k in ("a", "c2", "c3")}
             if name == "x*":
                 dn, e = compare_biasfree(name, data, halves, m, G, a.dmin, rows)
@@ -463,6 +507,15 @@ def cmd_compare(a):
                 np.savez(out, **{**D, **dn}, fit_e=e, dmin=a.dmin)
                 print(f"   normalized data (envelope from x*) -> {out}")
             cors.append((name,) + correlations(data, halves, m, G, a.dmin))
+            if a.pose_fit:
+                _, _, h2_, pairs_, _, h3_ = cors[0]
+                rel2_, rel3_ = pairs_ & (h2_ > a.min_repro), h3_ > a.min_repro
+                keep3_ = biasfree_masks(G, a.dmin)[1][:, :, 0, 0, 0]
+                t0 = time.time()
+                pf = fit_pose_corr(A_, im, G, data, rel2_, rel3_, keep3_, a.pose_fit, dev)
+                pose_rows.append((name, pf))
+                print(f"   [{name}] fitted viewing density (P={a.pose_fit}): c2 {pf['c2']:+.3f}, c3 {pf['c3']:+.3f} "
+                      f"(nu in [{pf['nu_min']:.2f}, {pf['nu_max']:.2f}]; {time.time() - t0:.0f} s; {pf['msg']})")
         # envelope-free comparison: correlation per bias-free entry, on entries the data reproduce
         _, _, h2, pairs, _, h3 = cors[0]
         rel2 = pairs & (h2 > a.min_repro)
@@ -482,6 +535,12 @@ def cmd_compare(a):
             print(f"   {name[:24]:<24} " + " ".join(f"{v:+.2f}" for v in row))
         hrow = [h2[i][pairs[i]].mean() for i in range(NK)]
         print(f"   {'(half vs half)':<24} " + " ".join(f"{v:+.2f}" for v in hrow))
+        if pose_rows:
+            print(f"\n   with a fitted viewing density (P = {a.pose_fit}; reproduced entries): structure: c2 uniform -> fitted, "
+                  f"c3 uniform -> fitted")
+            for (name, pf), (_, r2, _, _, r3, _) in zip(pose_rows, cors):
+                print(f"   {name[:32]:<32} {r2[rel2].mean():+.3f} -> {pf['c2']:+.3f}    {r3[rel3].mean():+.3f} -> {pf['c3']:+.3f}"
+                      f"    nu in [{pf['nu_min']:.2f}, {pf['nu_max']:.2f}]")
         return
     print(f"{a.data}: {int(D['n_images'])} images, center={D['center']}; fit (s, dB) on shells {a.fit_from + 1}..{len(K)}")
     for name, at in models:
@@ -620,6 +679,7 @@ def main():
     c.add_argument("--diag", dest="biasfree", action="store_false", help="old comparison incl. noise-biased entries")
     c.add_argument("--dmin", type=int, default=2, help="minimum shell separation of the c2 entries used")
     c.add_argument("--min-repro", type=float, default=0.5, help="half-vs-half correlation for an entry to count as reproduced")
+    c.add_argument("--pose-fit", type=int, default=0, help="also fit a viewing density (even SH degree P, e.g. 4) per structure")
     c.add_argument("--rp-margin", type=int, default=6, help="orders beyond 2 pi k r_p treated as signal")
     c.add_argument("--envelope", choices=("gauss", "shell"), default="shell",
                    help="shell: free per-shell envelope from the c2 power (default); gauss: s exp(-dB k^2/4) fitted to a")
